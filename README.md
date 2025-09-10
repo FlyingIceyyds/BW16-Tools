@@ -1,10 +1,10 @@
-# [BW16-Tools](https://github.com/FlyingIceyyds/BW16-Tools)
+# 🛠️ [BW16-Tools](https://github.com/FlyingIceyyds/BW16-Tools)
 基于Ai-Thinker BW16 RTL8720DN 的轻量级综合无线安全测试工具。包含解除身份认证（Deauth），信道干扰（Channel Interference），Deauth/Disassoc帧检测（Detect），密码钓鱼（Phishing），认证/关联帧洪水攻击（Dos）等。仅用于安全性研究和教育目的，请勿滥用。使用Arduino开发。
 
-# 使用须知
+# 📌 使用须知
 本项目旨在合规前提下用于安全性研究和教育目的，请勿滥用。
 
-# 功能介绍
+# 📑 功能介绍
 - 扫描SSID/AP [Scan]
     - 快速扫描：常规主动+被动扫描
     - 深度扫描：多种扫描模式，逐个信道扫描
@@ -37,10 +37,10 @@
     - 目前Web UI唯一功能：自定义SSID信标帧攻击
     - Web UI会占用更多资源，不考虑添加OLED菜单重复功能，无意义
 
-# OLED UI
+# 📟 OLED UI
 ![UI](./img/ui.png "0.96 OLED UI")
 
-# 部分代码来源
+# 🔗 部分代码来源
 - https://github.com/shiyi226/5gwifi-bw16
     - 2025-06-11
 - https://github.com/tesa-klebeband/RTL8720dn-WiFi-Packet-Injection
@@ -50,14 +50,14 @@
 - https://github.com/wangergou2023/dog
     - 2024-07-15
 
-# 许可证
+# 🧾 许可证
 采用 [GPL 3.0](https://www.gnu.org/licenses/gpl-3.0.html) 许可证，使用此项目，请遵守：
 
 - 禁止修改后闭源售卖
 - 禁止应用于闭源项目/产品
 - 售卖衍生产品需保留版权并无条件提供源代码
 
-# 使用指南
+# 🧭 使用指南
 
 ## 物料
 - Ai-Thinker BW16-Kit (RTL8720DN)
