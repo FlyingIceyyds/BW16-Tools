@@ -77,7 +77,7 @@ const char WEB_ADMIN_HTML[] PROGMEM = R"rawliteral(
       <h2>关于本项目</h2>
       <div class="card" id="HomeCard">
         <p>github.com/FlyingIceyyds/Bw16-Tools</p>
-        <p>采用GPL-3.0协议开源，请勿将此项目及其衍生作品用作商业用途，严禁倒卖固件！</p>
+        <p>采用GPL-3.0协议开源，请勿倒卖源代码或修改后闭源售卖</p>
       </div>
       <h2 style="margin-top:14px;">Web UI说明</h2>
       <div class="status">当前版本Web UI仅包含OLED菜单无法操作的功能，不添加重复功能</div>
