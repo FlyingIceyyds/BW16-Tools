@@ -46,7 +46,7 @@ class AnimationBase : IAnimation {
 	  }
 
   protected:
-	  float Calculate(unsigned long elapsedMillis) override { return 0.0; }
+	  float Calculate(unsigned long elapsedMillis __attribute__((unused))) override { return 0.0; }
 };
 
 class DeltaAnimation : public AnimationBase {

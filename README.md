@@ -17,6 +17,9 @@
 本项目旨在合规前提下用于安全性研究和教育目的，请勿滥用。
 
 # 📑 功能介绍
+
+## WIFI 功能
+
 - 扫描SSID/AP [Scan]
     - 快速扫描：常规主动+被动扫描
     - 深度扫描：多种扫描模式，逐个信道扫描
@@ -47,7 +50,19 @@
     - 右上角出现“[*]”指示，表示监听到了解除认证/关联帧
 - Web UI
     - 自定义SSID信标帧攻击 [Custom Beacon]
-    - WPA/WPA2握手包抓取 [Handshake Capture]
+    - WPA/WPA2握手包抓取 [Handshake Capture]（在Beta版中完全不可用）
+
+## BLE 功能
+
+- 蓝牙信标广播
+    - 广播：Apple全家桶，小米全家桶，华为全家桶，Google全家桶，米家大杂烩，罕见设备，儿童玩具
+    - 广播发送大量对应厂商的蓝牙设备，类似WIFI信标帧攻击，仅发送信标数据，无法连接
+- 蓝牙弹窗攻击
+    - iOS 快速配对弹窗
+    - iOS Action Modal
+    - iOS 17 崩溃攻击（疑似已修复）
+    - Windows Swift Pair 弹窗
+    - 针对旧版安卓设备的快速配对弹窗
 
 # 📟 OLED UI
 ![UI](./img/ui.png "0.96 OLED UI")

@@ -1354,7 +1354,7 @@ bool hasBothHandshakeDirections() {
 
 
 // 仅进行M1–M4形态、同一STA、BSSID匹配与回放计数模式校验，不要求Auth/Assoc近时佐证
-static bool isFourWayStructurallyValid() {
+static __attribute__((unused)) bool isFourWayStructurallyValid() {
   if (capturedHandshake.frameCount < 4) return false;
   bool hasMessage1 = false, hasMessage2 = false, hasMessage3 = false, hasMessage4 = false;
   bool staLocked = false; uint8_t staMac[6] = {0};

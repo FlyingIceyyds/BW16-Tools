@@ -96,7 +96,7 @@ class EyeDrawer {
     }
 
     // Draw rounded corners
-    static void FillEllipseCorner(CornerType corner, int16_t x0, int16_t y0, int32_t rx, int32_t ry, uint16_t color) {
+    static void FillEllipseCorner(CornerType corner, int16_t x0, int16_t y0, int32_t rx, int32_t ry, uint16_t color __attribute__((unused))) {
       if (rx < 2) return;
       if (ry < 2) return;
       int32_t x, y;

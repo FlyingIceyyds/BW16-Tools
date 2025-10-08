@@ -22,7 +22,7 @@ LookAssistant::LookAssistant(Face& face) : _face(face), Timer(4000)
 void LookAssistant::LookAt(float x, float y)
 {
 	int16_t moveX_x;
-	int16_t moveY_x;
+	int16_t moveY_x __attribute__((unused));
 	int16_t moveY_y;
 	float scaleY_x;
 	float scaleY_y;
